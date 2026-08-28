@@ -33,8 +33,9 @@ const REFRESH_SKEW_MS = 24 * 3600_000 // 到期前 24 小时内刷新（同 trae
 const COOL_DOWN_MS = 60 * 1000 // 失败冷却 60s
 
 /** 模型来源：CodeBuddy 上游无公开 models 接口（copilot.tencent.com 不暴露），
- * 内置模型列表来自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json，
- * 只保留各系列最新版本（v4 / 5.2 / M3 / K2.7 / Hy3 / Hunyuan-2.0）。
+ * 内置模型列表来自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json +
+ * 9router 实际使用记录（hy4/hy4-preview 由服务器下发，本地 product.json 没有）。
+ * 只保留各系列最新版本（v4 / 5.2 / M3 / K2.7 / Hy4 / Hunyuan-2.0）。
  * 用户在面板仍可添加自定义模型。 */
 const BUILTIN_MODELS: ModelInfo[] = [
   { id: 'deepseek-v4-pro', context_length: 1000000 },
@@ -42,6 +43,8 @@ const BUILTIN_MODELS: ModelInfo[] = [
   { id: 'glm-5.2', context_length: 200000 },
   { id: 'minimax-m3-play', context_length: 512000 },
   { id: 'kimi-k2.7-code', context_length: 256000 },
+  { id: 'hy4-preview', context_length: 192000 },
+  { id: 'hy4', context_length: 192000 },
   { id: 'hy3-preview', context_length: 192000 },
   { id: 'hunyuan-2.0-thinking', context_length: 128000 },
 ]
