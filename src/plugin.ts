@@ -32,6 +32,15 @@ const POLL_TIMEOUT_MS = 5 * 60 * 1000
 const REFRESH_SKEW_MS = 24 * 3600_000 // 到期前 24 小时内刷新（同 traework）
 const COOL_DOWN_MS = 60 * 1000 // 失败冷却 60s
 
+// 签到与积分（实测：POST body '{}'，Bearer accessToken）
+// 注：checkin-status 的 today_checked_in/total_credits 恒为 false/0（活动字段不可靠），
+//     故「是否可签到」靠 daily-checkin 幂等返回判断，积分取 get-user-resource 的 TotalDosage。
+const USAGE_URL = `${BASE}/v2/billing/meter/get-user-resource`
+const DAILY_CHECKIN_URL = `${BASE}/billing/meter/daily-checkin`
+/** 今日已签到（幂等，视为成功）。 */
+const ALREADY_CHECKED_IN_CODE = 10001
+const CREDITS_TTL_MS = 10 * 60 * 1000 // 积分缓存 10 分钟
+
 /** 模型来源：CodeBuddy 上游无公开 models 接口（copilot.tencent.com 不暴露），
  * 内置模型列表来自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json +
  * 9router 实际使用记录（hy4/hy4-preview 由服务器下发，本地 product.json 没有）。
@@ -102,6 +111,8 @@ export default function factory(env: SupplierEnv): SupplierModule {
   const cooling = new Map<string, number>()
   /** 上次 chatCompletions 失败原因（供核心测试模型汇总诊断）。 */
   let lastErr: string | undefined
+  /** 积分缓存：uid → { value, at }（status() 同步返回，过期后台异步刷新）。 */
+  const creditsCache = new Map<string, { value: number; at: number }>()
 
   function listUids(): string[] {
     return creds.list(id)
@@ -122,7 +133,79 @@ export default function factory(env: SupplierEnv): SupplierModule {
     return (cooling.get(uid) ?? 0) > now
   }
 
-  /** 冷却某账号（测试/请求失败时调用，让后续回退跳过它）。 */
+  /** 拉取某账号积分（get-user-resource 的 TotalDosage，实测签到后会 +100），更新缓存。 */
+  async function refreshCredits(uid: string): Promise<number | undefined> {
+    const cred = getCred(uid)
+    if (!cred) return undefined
+    try {
+      const fresh = await refreshIfNeeded(uid, cred)
+      const resp = await fetch(USAGE_URL, {
+        method: 'POST',
+        headers: headers(fresh.accessToken, { 'Content-Type': 'application/json' }),
+        body: '{}',
+        signal: AbortSignal.timeout(20000),
+      })
+      const j = (await resp.json()) as { code?: number; data?: { Response?: { Data?: { TotalDosage?: number } } } }
+      const value = j.data?.Response?.Data?.TotalDosage
+      if (resp.ok && j.code === 0 && typeof value === 'number') {
+        creditsCache.set(uid, { value, at: Date.now() })
+        return value
+      }
+    } catch {
+      // 积分拉取失败不阻塞主流程
+    }
+    return undefined
+  }
+
+  /** 单账号签到：直接签到（幂等：已签到返回 10001），成功后刷新积分缓存。
+   *  实测 checkin-status 的 today_checked_in 恒为 false（活动字段不可靠），故不预查状态。 */
+  async function checkinOne(uid: string): Promise<{ uid: string; ok: boolean; status: string; message?: string }> {
+    const cred = getCred(uid)
+    if (!cred) return { uid, ok: false, status: 'error', message: '凭证缺失' }
+    let token: string
+    try {
+      token = (await refreshIfNeeded(uid, cred)).accessToken
+    } catch {
+      token = cred.accessToken
+    }
+    try {
+      const resp = await fetch(DAILY_CHECKIN_URL, {
+        method: 'POST',
+        headers: headers(token, { 'Content-Type': 'application/json' }),
+        body: '{}',
+        signal: AbortSignal.timeout(20000),
+      })
+      // 已签到时上游返回 HTTP 400 + code=10001（幂等），故先解析 body 的 code 再判状态
+      let j: { code?: number; msg?: string; data?: { credit?: number; streak_days?: number } } | undefined
+      try {
+        j = (await resp.json()) as typeof j
+      } catch {
+        // 非 JSON（如 WAF/网关 HTML）
+      }
+      if (j?.code === ALREADY_CHECKED_IN_CODE) return { uid, ok: true, status: 'already', message: j.msg ?? '今日已签到' }
+      if (j !== undefined && j.code !== undefined && j.code !== 0) {
+        return { uid, ok: false, status: 'error', message: j.msg ?? `签到失败 code=${String(j.code)}` }
+      }
+      if (!resp.ok) {
+        // 401/403 = 凭证失效（非 JSON 网关拦截也算），冷却该账号避免反复重试
+        if (resp.status === 401 || resp.status === 403) {
+          cooling.set(uid, Date.now() + COOL_DOWN_MS)
+          return { uid, ok: false, status: 'error', message: `凭证失效 ${resp.status}` }
+        }
+        return { uid, ok: false, status: 'error', message: `签到失败 ${resp.status}` }
+      }
+      await refreshCredits(uid) // 签到后积分变化，刷新缓存
+      const days = j?.data?.streak_days
+      return {
+        uid,
+        ok: true,
+        status: 'ok',
+        message: `+${j?.data?.credit ?? 0} 积分${typeof days === 'number' ? `（连续 ${days} 天）` : ''}`,
+      }
+    } catch (err) {
+      return { uid, ok: false, status: 'error', message: (err as Error).message }
+    }
+  }
 
   /** 刷新 token（若临近过期）。返回新 cred 或原样。 */
   async function refreshIfNeeded(uid: string, cred: CodeBuddyCred): Promise<CodeBuddyCred> {
@@ -165,16 +248,31 @@ export default function factory(env: SupplierEnv): SupplierModule {
       const now = Date.now()
       const accounts = orderedUids().map((uid) => {
         const cred = getCred(uid)
+        // 积分读缓存（同步）；过期则后台异步刷新，下次刷新面板即显示新值
+        const cached = creditsCache.get(uid)
+        if (cached === undefined || now - cached.at > CREDITS_TTL_MS) void refreshCredits(uid)
         return {
           uid,
           nickname: cred?.nickname || 'CodeBuddy',
-          credits: 0,
+          credits: cached?.value ?? 0,
           cooling: isCooling(uid, now),
           disabled: false,
           err_count: 0,
         }
       })
       return { id, name, accounts }
+    },
+    /** 签到：按核心 checkinRule（all=所有链接 / first=首个）逐个签到，每日 100 积分（连续 7 天 1000）。 */
+    checkinNow: async (): Promise<{ ok: boolean; total: number; succeeded: number; already: number; error?: string; results?: Array<{ uid: string; ok: boolean; status?: string; message?: string }> }> => {
+      const uids = orderedUids().filter((u) => getCred(u) !== undefined)
+      if (uids.length === 0) return { ok: false, total: 0, succeeded: 0, already: 0, error: '未添加链接' }
+      const targets = store.get(id).checkinRule === 'first' ? uids.slice(0, 1) : uids
+      const results: Array<{ uid: string; ok: boolean; status?: string; message?: string }> = []
+      for (const uid of targets) results.push(await checkinOne(uid))
+      const succeeded = results.filter((r) => r.status === 'ok').length
+      const already = results.filter((r) => r.status === 'already').length
+      log(`codebuddy checkin: ${succeeded} ok / ${already} already / ${targets.length} total`)
+      return { ok: succeeded + already > 0, total: targets.length, succeeded, already, results }
     },
     listModels: (): ModelInfo[] => BUILTIN_MODELS, // 内置模型列表(来自 WorkBuddy.app product.json),用户仍可自定义
     getAlias: (): string => 'cbcn',

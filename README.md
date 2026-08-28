@@ -10,6 +10,8 @@ DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `co
 - **内置模型列表**：上游无公开 models 接口，模型列表取自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json + 9router 实际使用记录，只保留各系列最新版本（DeepSeek-V4 / GLM-5.2 / MiniMax-M3 / Kimi-K2.7 / Hy4+Hy3 / Hunyuan-2.0），面板「可用模型」自动出现；仍可在面板手动添加自定义模型
 - **连接池**：多账号按池顺序/策略（`fallback` / `round-robin`）回退，失败冷却 60s
 - **token 自动刷新**：到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token
+- **签到领积分**：面板「签到」按 dsh-router 的签到规则（`all` 所有链接 / `first` 首个）逐个签到，每日 100 积分（连续第 7 天 1000）；已签到上游返回 `code=10001`（HTTP 400 + 该码），幂等视为成功
+- **积分显示**：面板账号积分取 `get-user-resource` 的 `TotalDosage`（实测签到后 +100），10 分钟缓存，签到后自动刷新
 
 ## 安装(DSH)
 
