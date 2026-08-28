@@ -29,7 +29,7 @@ const REFRESH_URL = `${BASE}/v2/plugin/auth/token/refresh`
 const UA = 'CLI/2.108.1 CodeBuddy/2.108.1'
 const POLL_INTERVAL_MS = 5000
 const POLL_TIMEOUT_MS = 5 * 60 * 1000
-const REFRESH_SKEW_MS = 5 * 60 * 1000 // 到期前 5 分钟刷新
+const REFRESH_SKEW_MS = 24 * 3600_000 // 到期前 24 小时内刷新（同 traework）
 const COOL_DOWN_MS = 60 * 1000 // 失败冷却 60s
 
 /** 模型来源：CodeBuddy 上游无公开 models 接口，模型由 dsh-router 统一管理

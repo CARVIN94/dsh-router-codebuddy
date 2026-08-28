@@ -9,7 +9,7 @@ DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `co
 - **OAuth 轮询登录**：生成登录链接 → 浏览器登录 → 后台轮询 token（每 5s，最多 5 分钟），自动落盘凭证
 - **模型由 dsh-router 统一管理**：上游无公开 models 接口，插件不内置模型列表——核心缓存 `listModels` 结果，用户在面板「可用模型」手动添加自定义模型
 - **连接池**：多账号按池顺序/策略（`fallback` / `round-robin`）回退，失败冷却 60s
-- **token 自动刷新**：到期前 5 分钟用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token
+- **token 自动刷新**：到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token
 
 ## 安装
 
@@ -47,7 +47,7 @@ cordis.patch.yml  bundle patch，把插件插入 DSH cordis bundle stack
 
 - **chat**：`POST /v2/chat/completions`（强制流式，非流式上游拒绝；失败冷却 60s 按池换号回退，透传 SSE）
 - **登录**：`POST /v2/plugin/auth/state` 生成链接 → 浏览器登录 → 轮询 `GET /v2/plugin/auth/token?state=...`（每 5s，最多 5 分钟）换 token 落盘
-- **刷新**：`POST /v2/plugin/auth/token/refresh`（`X-Refresh-Token` 头，到期前 5 分钟触发）
+- **刷新**：`POST /v2/plugin/auth/token/refresh`（`X-Refresh-Token` 头，到期前 24 小时内触发）
 - 凭证：`auths/codebuddy/{uid}.json`（`{nickname, accessToken, refreshToken, expiresAt}`）
 
 ## 架构
