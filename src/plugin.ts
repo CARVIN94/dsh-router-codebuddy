@@ -83,6 +83,7 @@ function gatewayError(body: string, status: number): string {
   return `upstream ${status}: ${body.slice(0, 200)}`
 }
 
+
 /** 剥 alias 前缀（cbcn/glm-5.2 → glm-5.2）。 */
 function stripAlias(model: string): string {
   const slash = model.lastIndexOf('/')
@@ -99,6 +100,8 @@ export default function factory(env: SupplierEnv): SupplierModule {
   let pendingUid: string | undefined
 
   const cooling = new Map<string, number>()
+  /** 上次 chatCompletions 失败原因（供核心测试模型汇总诊断）。 */
+  let lastErr: string | undefined
 
   function listUids(): string[] {
     return creds.list(id)
@@ -118,6 +121,8 @@ export default function factory(env: SupplierEnv): SupplierModule {
   function isCooling(uid: string, now = Date.now()): boolean {
     return (cooling.get(uid) ?? 0) > now
   }
+
+  /** 冷却某账号（测试/请求失败时调用，让后续回退跳过它）。 */
 
   /** 刷新 token（若临近过期）。返回新 cred 或原样。 */
   async function refreshIfNeeded(uid: string, cred: CodeBuddyCred): Promise<CodeBuddyCred> {
@@ -258,36 +263,20 @@ export default function factory(env: SupplierEnv): SupplierModule {
       cooling.delete(uid)
       return Promise.resolve(true)
     },
-    testModel: async (mid: string): Promise<{ ok: boolean; error?: string }> => {
-      const base = stripAlias(mid)
-      if (base === '') return { ok: false, error: `unknown model ${JSON.stringify(mid)}` }
-      const uids = orderedUids()
-      if (uids.length === 0) return { ok: false, error: '未添加链接（点「添加链接」登录 CodeBuddy）' }
-      for (const uid of uids) {
-        const cred = getCred(uid)
-        if (!cred) continue
-        const fresh = await refreshIfNeeded(uid, cred)
-        try {
-          const resp = await fetch(CHAT_URL, {
-            method: 'POST',
-            headers: headers(fresh.accessToken, { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ model: base, messages: [{ role: 'user', content: 'ping' }], stream: true, max_tokens: 8 }),
-            signal: AbortSignal.timeout(30000),
-          })
-          if (resp.ok) return { ok: true }
-          const body = await resp.text().catch(() => '')
-          return { ok: false, error: gatewayError(body, resp.status) }
-        } catch (err) {
-          return { ok: false, error: (err as Error).message }
-        }
-      }
-      return { ok: false, error: 'no healthy account' }
-    },
+    // testModel 由 dsh-router 核心统一走 chatCompletions 路径（账号池回退/冷却自动生效）
+    lastError: (): string | undefined => lastErr,
     async chatCompletions(req: ChatRequest, res: ServerResponse): Promise<boolean> {
       const base = stripAlias(req.model)
-      if (base === '') return false
+      if (base === '') {
+        lastErr = `unknown model ${JSON.stringify(req.model)}`
+        return false
+      }
       const uids = orderedUids().filter((u) => !isCooling(u) && getCred(u) !== undefined)
-      if (uids.length === 0) return false
+      if (uids.length === 0) {
+        lastErr = '所有账号都在冷却中（稍后重试）'
+        return false
+      }
+      lastErr = undefined
 
       // CodeBuddy 只支持流式：非流式请求也强制 stream:true（9router 同）
       let body = req.rawBody
@@ -300,7 +289,6 @@ export default function factory(env: SupplierEnv): SupplierModule {
         // 保持原样
       }
 
-      let lastErr = ''
       for (const uid of uids) {
         const cred = getCred(uid)
         if (!cred) continue
