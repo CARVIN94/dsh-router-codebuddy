@@ -11,15 +11,26 @@ DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `co
 - **连接池**：多账号按池顺序/策略（`fallback` / `round-robin`）回退，失败冷却 60s
 - **token 自动刷新**：到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token
 
-## 安装
+## 安装(DSH)
+
+先装核心 [dsh-router-core](https://github.com/CARVIN94/dsh-router)(dsh-router 仓库,提供面板 + 内置供应商),再装本插件:
 
 ```bash
-npm install dsh-router-codebuddy
-# 或
+cd ~/.dsh/profiles/web
+pnpm add dsh-router-core
 pnpm add dsh-router-codebuddy
 ```
 
-确保 [dsh-router](https://github.com/CARVIN94/dsh-router) 已安装。本插件通过 `cordis.patch.yml` 自动挂载到 DSH bundle stack，并以 cordis service `router.suppliers` 向 dsh-router 注册 `codebuddy` 供应商工厂。
+装完确认 `~/.dsh/profiles/web/package.json`:
+- `dependencies` 含 `dsh-router-core` 和 `dsh-router-codebuddy`(npm 版本号);
+- `dsh.profile.bundles` 含 `dsh-router` 和 `dsh-router-codebuddy`——
+  插件的 `cordis.patch.yml` 会自动插入 bundle,一般无需手改。
+
+然后**重启 `dsh web`**。本插件以 cordis service `router.suppliers` 向 dsh-router
+注册 `codebuddy` 供应商,面板「供应商」出现 CodeBuddy 卡片。
+
+> 本地开发版:不用 npm,直接 `dependencies` 加
+> `"dsh-router-codebuddy": "link:/path/to/dsh-router-codebuddy"` 指向本地仓库。
 
 ## 目录
 
@@ -34,12 +45,8 @@ cordis.patch.yml  bundle patch，把插件插入 DSH cordis bundle stack
 
 ## 使用
 
-1. 构建：`pnpm run build`
-2. 挂载（profile `package.json`）：
-   - `dsh.profile.bundles` 加 `dsh-router-codebuddy`
-   - dependencies 加 `"dsh-router-codebuddy": "link:/path/to/dsh-router-codebuddy"`
-3. 重启 `dsh web`
-4. 面板 → 供应商 → CodeBuddy 卡片 → 添加链接 → 浏览器登录 → 完成添加（轮询式登录，无粘贴回调步骤）
+1. 重启 `dsh web`
+2. 面板 → 供应商 → CodeBuddy 卡片 → 添加链接 → 浏览器登录 → 完成添加（轮询式登录，无粘贴回调步骤）
 
 新增的 CodeBuddy 账号会出现在面板账号池中；模型需在面板「可用模型」添加（如 `glm-5.2`）后启用，`/v1/chat/completions` 请求模型可写 `glm-5.2` 或带别名前缀 `cbcn/glm-5.2`（插件自动剥前缀）。
 
