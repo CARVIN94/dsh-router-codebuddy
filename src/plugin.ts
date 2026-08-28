@@ -34,35 +34,16 @@ const COOL_DOWN_MS = 60 * 1000 // 失败冷却 60s
 
 /** 模型来源：CodeBuddy 上游无公开 models 接口（copilot.tencent.com 不暴露），
  * 内置模型列表来自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json，
- * 与 9router codebuddy-cn 一致。用户在面板仍可添加自定义模型。 */
+ * 只保留各系列最新版本（v4 / 5.2 / M3 / K2.7 / Hy3 / Hunyuan-2.0）。
+ * 用户在面板仍可添加自定义模型。 */
 const BUILTIN_MODELS: ModelInfo[] = [
   { id: 'deepseek-v4-pro', context_length: 1000000 },
   { id: 'deepseek-v4-flash', context_length: 1000000 },
-  { id: 'deepseek-v3-2-volc', context_length: 96000 },
-  { id: 'minimax-m2.5', context_length: 200000 },
-  { id: 'minimax-m2.7', context_length: 200000 },
-  { id: 'minimax-m3-play', context_length: 512000 },
   { id: 'glm-5.2', context_length: 200000 },
-  { id: 'glm-5.1', context_length: 200000 },
-  { id: 'glm-5.0', context_length: 200000 },
-  { id: 'glm-5.0-turbo', context_length: 200000 },
-  { id: 'glm-5v-turbo', context_length: 200000 },
-  { id: 'glm-4.7', context_length: 200000 },
-  { id: 'glm-4.6', context_length: 168000 },
-  { id: 'glm-4.6v', context_length: 128000 },
+  { id: 'minimax-m3-play', context_length: 512000 },
   { id: 'kimi-k2.7-code', context_length: 256000 },
-  { id: 'kimi-k2.7-code-highspeed', context_length: 256000 },
-  { id: 'kimi-k2.6', context_length: 256000 },
-  { id: 'kimi-k2.5', context_length: 256000 },
-  { id: 'kimi-k2-thinking', context_length: 256000 },
-  { id: 'hy3-preview-agent', context_length: 192000 },
   { id: 'hy3-preview', context_length: 192000 },
-  { id: 'hunyuan-chat', context_length: 128000 },
   { id: 'hunyuan-2.0-thinking', context_length: 128000 },
-  { id: 'hunyuan-2.0-instruct', context_length: 128000 },
-  { id: 'deepseek-v3-1', context_length: 96000 },
-  { id: 'deepseek-v3-1-volc', context_length: 96000 },
-  { id: 'deepseek-r1-0528', context_length: 96000 },
 ]
 
 interface CodeBuddyCred {
