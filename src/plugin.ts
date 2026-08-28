@@ -32,8 +32,38 @@ const POLL_TIMEOUT_MS = 5 * 60 * 1000
 const REFRESH_SKEW_MS = 24 * 3600_000 // 到期前 24 小时内刷新（同 traework）
 const COOL_DOWN_MS = 60 * 1000 // 失败冷却 60s
 
-/** 模型来源：CodeBuddy 上游无公开 models 接口，模型由 dsh-router 统一管理
- *  （核心缓存 listModels 结果；用户在面板添加自定义模型）。插件不内置模型列表。 */
+/** 模型来源：CodeBuddy 上游无公开 models 接口（copilot.tencent.com 不暴露），
+ * 内置模型列表来自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json，
+ * 与 9router codebuddy-cn 一致。用户在面板仍可添加自定义模型。 */
+const BUILTIN_MODELS: ModelInfo[] = [
+  { id: 'deepseek-v4-pro', context_length: 1000000 },
+  { id: 'deepseek-v4-flash', context_length: 1000000 },
+  { id: 'deepseek-v3-2-volc', context_length: 96000 },
+  { id: 'minimax-m2.5', context_length: 200000 },
+  { id: 'minimax-m2.7', context_length: 200000 },
+  { id: 'minimax-m3-play', context_length: 512000 },
+  { id: 'glm-5.2', context_length: 200000 },
+  { id: 'glm-5.1', context_length: 200000 },
+  { id: 'glm-5.0', context_length: 200000 },
+  { id: 'glm-5.0-turbo', context_length: 200000 },
+  { id: 'glm-5v-turbo', context_length: 200000 },
+  { id: 'glm-4.7', context_length: 200000 },
+  { id: 'glm-4.6', context_length: 168000 },
+  { id: 'glm-4.6v', context_length: 128000 },
+  { id: 'kimi-k2.7-code', context_length: 256000 },
+  { id: 'kimi-k2.7-code-highspeed', context_length: 256000 },
+  { id: 'kimi-k2.6', context_length: 256000 },
+  { id: 'kimi-k2.5', context_length: 256000 },
+  { id: 'kimi-k2-thinking', context_length: 256000 },
+  { id: 'hy3-preview-agent', context_length: 192000 },
+  { id: 'hy3-preview', context_length: 192000 },
+  { id: 'hunyuan-chat', context_length: 128000 },
+  { id: 'hunyuan-2.0-thinking', context_length: 128000 },
+  { id: 'hunyuan-2.0-instruct', context_length: 128000 },
+  { id: 'deepseek-v3-1', context_length: 96000 },
+  { id: 'deepseek-v3-1-volc', context_length: 96000 },
+  { id: 'deepseek-r1-0528', context_length: 96000 },
+]
 
 interface CodeBuddyCred {
   nickname: string
@@ -157,7 +187,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
       })
       return { id, name, accounts }
     },
-    listModels: (): ModelInfo[] => [], // 无内置模型，由 dsh-router 统一管理（用户添加自定义模型）
+    listModels: (): ModelInfo[] => BUILTIN_MODELS, // 内置模型列表(来自 WorkBuddy.app product.json),用户仍可自定义
     getAlias: (): string => 'cbcn',
     /** OAuth 轮询登录：POST state → 返回 authUrl（浏览器打开），后台轮询 token。 */
     generateLoginUrl: async (): Promise<{ ok: boolean; error?: string; loginUrl?: string }> => {

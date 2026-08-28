@@ -7,7 +7,7 @@ DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `co
 ## 功能
 
 - **OAuth 轮询登录**：生成登录链接 → 浏览器登录 → 后台轮询 token（每 5s，最多 5 分钟），自动落盘凭证
-- **模型由 dsh-router 统一管理**：上游无公开 models 接口，插件不内置模型列表——核心缓存 `listModels` 结果，用户在面板「可用模型」手动添加自定义模型
+- **内置模型列表**：上游无公开 models 接口，模型列表取自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json——GLM/Kimi/MiniMax/DeepSeek/Hunyuan 等，面板「可用模型」自动出现；仍可在面板手动添加自定义模型
 - **连接池**：多账号按池顺序/策略（`fallback` / `round-robin`）回退，失败冷却 60s
 - **token 自动刷新**：到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token
 
@@ -45,7 +45,7 @@ cordis.patch.yml  bundle patch，把插件插入 DSH cordis bundle stack
 1. 重启 `dsh web`
 2. 面板 → 供应商 → CodeBuddy 卡片 → 添加链接 → 浏览器登录 → 完成添加（轮询式登录，无粘贴回调步骤）
 
-新增的 CodeBuddy 账号会出现在面板账号池中；模型需在面板「可用模型」添加（如 `glm-5.2`）后启用，`/v1/chat/completions` 请求模型可写 `glm-5.2` 或带别名前缀 `cbcn/glm-5.2`（插件自动剥前缀）。
+新增的 CodeBuddy 账号会出现在面板账号池中；模型列表已内置（自动出现在面板「可用模型」），仍可手动添加自定义模型。`/v1/chat/completions` 请求模型可写 `glm-5.2` 或带别名前缀 `cbcn/glm-5.2`（插件自动剥前缀）。
 
 ## 上游
 
