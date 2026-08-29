@@ -29,6 +29,8 @@ const REFRESH_URL = `${BASE}/v2/plugin/auth/token/refresh`
 const UA = 'CLI/2.108.1 CodeBuddy/2.108.1'
 const POLL_INTERVAL_MS = 5000
 const POLL_TIMEOUT_MS = 5 * 60 * 1000
+/** 默认前缀（用户可在面板改；loader 包装会优先用 store 里的值）。 */
+const DEFAULT_ALIAS = 'cbcn'
 const REFRESH_SKEW_MS = 24 * 3600_000 // 到期前 24 小时内刷新（同 traework）
 const COOL_DOWN_MS = 60 * 1000 // 失败冷却 60s
 
@@ -102,9 +104,10 @@ function gatewayError(body: string, status: number): string {
 
 
 /** 剥 alias 前缀（cbcn/glm-5.2 → glm-5.2）。 */
-function stripAlias(model: string): string {
-  const slash = model.lastIndexOf('/')
-  return slash >= 0 ? model.slice(slash + 1) : model
+/** 剥本供应商 alias 前缀（只剥自己的，模型 id 自带的斜杠保留，否则自定义模型
+ *  `org/name` 会被剥成 `name`，请求必然 404）。 */
+function stripAlias(model: string, alias: string): string {
+  return alias !== '' && model.startsWith(`${alias}/`) ? model.slice(alias.length + 1) : model
 }
 
 export default function factory(env: SupplierEnv): SupplierModule {
@@ -135,6 +138,11 @@ export default function factory(env: SupplierEnv): SupplierModule {
     const all = listUids()
     const order = store.get(id).poolOrder
     return [...order.filter((u) => all.includes(u)), ...all.filter((u) => !order.includes(u))]
+  }
+
+  /** 当前前缀（与 loader 包装一致：store 覆盖默认值）。 */
+  function currentAlias(): string {
+    return env.store.get(id).alias || DEFAULT_ALIAS
   }
 
   function isCooling(uid: string, now = Date.now()): boolean {
@@ -392,7 +400,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
     // testModel 由 dsh-router 核心统一走 chatCompletions 路径（账号池回退/冷却自动生效）
     lastError: (): string | undefined => lastErr,
     async chatCompletions(req: ChatRequest, res: ServerResponse): Promise<boolean> {
-      const base = stripAlias(req.model)
+      const base = stripAlias(req.model, currentAlias())
       if (base === '') {
         lastErr = `unknown model ${JSON.stringify(req.model)}`
         return false
