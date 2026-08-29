@@ -40,6 +40,14 @@ const DAILY_CHECKIN_URL = `${BASE}/billing/meter/daily-checkin`
 /** 今日已签到（幂等，视为成功）。 */
 const ALREADY_CHECKED_IN_CODE = 10001
 const CREDITS_TTL_MS = 10 * 60 * 1000 // 积分缓存 10 分钟
+/** 周期结束距资源到期 >2 天 = 会续期的基础包(Refill)，否则是一次性赠送包(Bonus)。 */
+const REFILL_GAP_MS = 2 * 24 * 60 * 60 * 1000
+
+/** 取数值：优先 Precise 字符串字段（精确），回落到数字字段。 */
+function precise(preciseValue: unknown, plain: unknown): number {
+  const n = Number(preciseValue ?? plain)
+  return Number.isFinite(n) ? n : 0
+}
 
 /** 模型来源：CodeBuddy 上游无公开 models 接口（copilot.tencent.com 不暴露），
  * 内置模型列表来自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json +
@@ -133,7 +141,9 @@ export default function factory(env: SupplierEnv): SupplierModule {
     return (cooling.get(uid) ?? 0) > now
   }
 
-  /** 拉取某账号积分（get-user-resource 的 TotalDosage，实测签到后会 +100），更新缓存。 */
+  /** 拉取某账号剩余积分（get-user-resource 的包 CapacityRemain 求和），更新缓存。
+   *  注意：TotalDosage 是「累计已消耗」，不是剩余额度（踩过）。
+   *  Refill 包（基础体验包，周期续期）看 Cycle 字段，Bonus 包（一次性赠送）看 plain 字段。 */
   async function refreshCredits(uid: string): Promise<number | undefined> {
     const cred = getCred(uid)
     if (!cred) return undefined
@@ -145,9 +155,23 @@ export default function factory(env: SupplierEnv): SupplierModule {
         body: '{}',
         signal: AbortSignal.timeout(20000),
       })
-      const j = (await resp.json()) as { code?: number; data?: { Response?: { Data?: { TotalDosage?: number } } } }
-      const value = j.data?.Response?.Data?.TotalDosage
-      if (resp.ok && j.code === 0 && typeof value === 'number') {
+      const j = (await resp.json()) as {
+        code?: number
+        data?: { Response?: { Data?: { Accounts?: Array<Record<string, unknown>> } } }
+      }
+      const accounts = j.data?.Response?.Data?.Accounts
+      if (resp.ok && j.code === 0 && Array.isArray(accounts)) {
+        let remain = 0
+        for (const a of accounts) {
+          const cycleEnd = typeof a.CycleEndTime === 'string' ? Date.parse(a.CycleEndTime) : Number.NaN
+          const deductionEnd = Number(a.DeductionEndTime)
+          // 周期结束远早于资源到期 = 会续期的基础包，其余是一次性赠送包
+          const isRefill = Number.isFinite(cycleEnd) && Number.isFinite(deductionEnd) && deductionEnd - cycleEnd > REFILL_GAP_MS
+          remain += isRefill
+            ? precise(a.CycleCapacityRemainPrecise, a.CycleCapacityRemain)
+            : precise(a.CapacityRemainPrecise, a.CapacityRemain)
+        }
+        const value = Math.round(remain * 100) / 100
         creditsCache.set(uid, { value, at: Date.now() })
         return value
       }

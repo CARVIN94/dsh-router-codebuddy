@@ -11,7 +11,7 @@ DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `co
 - **连接池**：多账号按池顺序/策略（`fallback` / `round-robin`）回退，失败冷却 60s
 - **token 自动刷新**：到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token
 - **签到领积分**：面板「签到」按 dsh-router 的签到规则（`all` 所有链接 / `first` 首个）逐个签到，每日 100 积分（连续第 7 天 1000）；已签到上游返回 `code=10001`（HTTP 400 + 该码），幂等视为成功
-- **积分显示**：面板账号积分取 `get-user-resource` 的 `TotalDosage`（实测签到后 +100），10 分钟缓存，签到后自动刷新
+- **积分显示**：面板账号积分 = `get-user-resource` 各额度包的**剩余**求和（`CapacityRemain`，会续期的基础包取 `CycleCapacityRemain`），10 分钟缓存，签到后自动刷新。注意 `TotalDosage` 是**累计已消耗**，不是剩余
 
 ## 安装(DSH)
 
