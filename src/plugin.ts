@@ -206,7 +206,11 @@ export default function factory(env: SupplierEnv): SupplierModule {
       } catch {
         // 非 JSON（如 WAF/网关 HTML）
       }
-      if (j?.code === ALREADY_CHECKED_IN_CODE) return { uid, ok: true, status: 'already', message: j.msg ?? '今日已签到' }
+      if (j?.code === ALREADY_CHECKED_IN_CODE) {
+        // 已签到也刷新积分：用户点签到就是想看当前额度，不该拿 10 分钟前的旧值
+        await refreshCredits(uid)
+        return { uid, ok: true, status: 'already', message: j.msg ?? '今日已签到' }
+      }
       if (j !== undefined && j.code !== undefined && j.code !== 0) {
         return { uid, ok: false, status: 'error', message: j.msg ?? `签到失败 code=${String(j.code)}` }
       }
