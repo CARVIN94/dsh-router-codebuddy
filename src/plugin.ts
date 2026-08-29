@@ -298,17 +298,11 @@ export default function factory(env: SupplierEnv): SupplierModule {
       })
       return { id, name, accounts }
     },
-    /** 签到：按核心 checkinRule（all=所有链接 / first=首个）逐个签到，每日 100 积分（连续 7 天 1000）。 */
-    checkinNow: async (): Promise<{ ok: boolean; total: number; succeeded: number; already: number; error?: string; results?: Array<{ uid: string; ok: boolean; status?: string; message?: string }> }> => {
-      const uids = orderedUids().filter((u) => getCred(u) !== undefined)
-      if (uids.length === 0) return { ok: false, total: 0, succeeded: 0, already: 0, error: '未添加链接' }
-      const targets = store.get(id).checkinRule === 'first' ? uids.slice(0, 1) : uids
-      const results: Array<{ uid: string; ok: boolean; status?: string; message?: string }> = []
-      for (const uid of targets) results.push(await checkinOne(uid))
-      const succeeded = results.filter((r) => r.status === 'ok').length
-      const already = results.filter((r) => r.status === 'already').length
-      log(`codebuddy checkin: ${succeeded} ok / ${already} already / ${targets.length} total`)
-      return { ok: succeeded + already > 0, total: targets.length, succeeded, already, results }
+    /** 签到：单账号（核心遍历所有链接 + 汇总），每日 100 积分（连续 7 天 1000）。 */
+    checkinNow: async (uid: string): Promise<{ ok: boolean; status: string; message?: string }> => {
+      const r = await checkinOne(uid)
+      log(`codebuddy checkin ${uid}: ${r.status}${r.message === undefined ? '' : ` (${r.message})`}`)
+      return r
     },
     listModels: (): ModelInfo[] => BUILTIN_MODELS, // 内置模型列表(来自 WorkBuddy.app product.json),用户仍可自定义
     getAlias: (): string => 'cbcn',
