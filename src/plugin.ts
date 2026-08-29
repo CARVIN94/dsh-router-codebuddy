@@ -11,9 +11,8 @@
  * CredentialStore（auths/codebuddy/{uid}.json，{ nickname, accessToken,
  * refreshToken, expiresAt }）。模型固定列表（同 9router codebuddy-cn）。
  */
-import type { ServerResponse } from 'node:http'
-import type { ChatRequest, ModelInfo, SupplierStatus } from './types.ts'
-import type { SupplierEnv, SupplierModule } from './contract.ts'
+import type { ChatRequest, ModelInfo } from './types.ts'
+import type { AccountState, ChatOnceResult, SupplierEnv, SupplierModule, SupplierStatusNow } from './contract.ts'
 
 export const id = 'codebuddy'
 export const name = 'CodeBuddy'
@@ -32,7 +31,6 @@ const POLL_TIMEOUT_MS = 5 * 60 * 1000
 /** 默认前缀（用户可在面板改；loader 包装会优先用 store 里的值）。 */
 const DEFAULT_ALIAS = 'cbcn'
 const REFRESH_SKEW_MS = 24 * 3600_000 // 到期前 24 小时内刷新（同 traework）
-const COOL_DOWN_MS = 60 * 1000 // 失败冷却 60s
 
 // 签到与积分（实测：POST body '{}'，Bearer accessToken）
 // 注：checkin-status 的 today_checked_in/total_credits 恒为 false/0（活动字段不可靠），
@@ -119,8 +117,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
   let pendingState: string | undefined
   let pendingUid: string | undefined
 
-  const cooling = new Map<string, number>()
-  /** 上次 chatCompletions 失败原因（供核心测试模型汇总诊断）。 */
+  /** 上次 chatOnce 失败原因（供核心测试模型汇总诊断）。 */
   let lastErr: string | undefined
   /** 积分缓存：uid → { value, at }（status() 同步返回，过期后台异步刷新）。 */
   const creditsCache = new Map<string, { value: number; at: number }>()
@@ -145,9 +142,6 @@ export default function factory(env: SupplierEnv): SupplierModule {
     return env.store.get(id).alias || DEFAULT_ALIAS
   }
 
-  function isCooling(uid: string, now = Date.now()): boolean {
-    return (cooling.get(uid) ?? 0) > now
-  }
 
   /** 拉取某账号剩余积分（get-user-resource 的包 CapacityRemain 求和），更新缓存。
    *  注意：TotalDosage 是「累计已消耗」，不是剩余额度（踩过）。
@@ -223,9 +217,9 @@ export default function factory(env: SupplierEnv): SupplierModule {
         return { uid, ok: false, status: 'error', message: j.msg ?? `签到失败 code=${String(j.code)}` }
       }
       if (!resp.ok) {
-        // 401/403 = 凭证失效（非 JSON 网关拦截也算），冷却该账号避免反复重试
+        // 401/403 = 凭证失效（非 JSON 网关拦截也算）。冷却/禁用是核心的活，
+        // 这里只报事实：核心下次请求时该号会按 session_dead 被禁用。
         if (resp.status === 401 || resp.status === 403) {
-          cooling.set(uid, Date.now() + COOL_DOWN_MS)
           return { uid, ok: false, status: 'error', message: `凭证失效 ${resp.status}` }
         }
         return { uid, ok: false, status: 'error', message: `签到失败 ${resp.status}` }
@@ -280,8 +274,9 @@ export default function factory(env: SupplierEnv): SupplierModule {
     name,
     priority,
     icon,
-    status: (): SupplierStatus => {
+    status: (): SupplierStatusNow => {
       const now = Date.now()
+      // 只报「现在状态」：凭证是否存在 + 积分。冷却/禁用/错误累计由核心叠加。
       const accounts = orderedUids().map((uid) => {
         const cred = getCred(uid)
         // 积分读缓存（同步）；过期则后台异步刷新，下次刷新面板即显示新值
@@ -291,9 +286,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
           uid,
           nickname: cred?.nickname || 'CodeBuddy',
           credits: cached?.value ?? 0,
-          cooling: isCooling(uid, now),
-          disabled: false,
-          err_count: 0,
+          state: (cred === undefined ? 'session_dead' : 'ok') as AccountState,
         }
       })
       return { id, name, accounts }
@@ -388,23 +381,21 @@ export default function factory(env: SupplierEnv): SupplierModule {
     removeLink: (uid: string): Promise<boolean> => {
       if (getCred(uid) === undefined) return Promise.resolve(false)
       creds.remove(id, uid)
-      cooling.delete(uid)
       return Promise.resolve(true)
     },
-    // testModel 由 dsh-router 核心统一走 chatCompletions 路径（账号池回退/冷却自动生效）
     lastError: (): string | undefined => lastErr,
-    async chatCompletions(req: ChatRequest, res: ServerResponse): Promise<boolean> {
+    /** 对单个账号调一次上游。选号/冷却/换号是核心的活，这里只报结果。 */
+    async chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult> {
       const base = stripAlias(req.model, currentAlias())
       if (base === '') {
         lastErr = `unknown model ${JSON.stringify(req.model)}`
-        return false
+        return { ok: false, state: 'unavailable', message: lastErr }
       }
-      const uids = orderedUids().filter((u) => !isCooling(u) && getCred(u) !== undefined)
-      if (uids.length === 0) {
-        lastErr = '所有账号都在冷却中（稍后重试）'
-        return false
+      const cred = getCred(uid)
+      if (cred === undefined) {
+        lastErr = `unknown account ${JSON.stringify(uid)}`
+        return { ok: false, state: 'unavailable', message: lastErr }
       }
-      lastErr = undefined
 
       // CodeBuddy 只支持流式：非流式请求也强制 stream:true（9router 同）
       let body = req.rawBody
@@ -417,66 +408,45 @@ export default function factory(env: SupplierEnv): SupplierModule {
         // 保持原样
       }
 
-      for (const uid of uids) {
-        const cred = getCred(uid)
-        if (!cred) continue
-        let fresh = cred
-        try {
-          fresh = await refreshIfNeeded(uid, cred)
-        } catch {
-          // 刷新失败继续用旧 token
-        }
-        let upstream: Response
-        try {
-          upstream = await fetch(CHAT_URL, {
-            method: 'POST',
-            headers: headers(fresh.accessToken, { 'Content-Type': 'application/json' }),
-            body,
-            signal: AbortSignal.timeout(120000),
-          })
-        } catch (err) {
-          cooling.set(uid, Date.now() + COOL_DOWN_MS)
-          lastErr = (err as Error).message
-          continue
-        }
-        if (upstream.status < 200 || upstream.status >= 300) {
-          cooling.set(uid, Date.now() + COOL_DOWN_MS)
-          const text = await upstream.text().catch(() => '')
-          lastErr = gatewayError(text, upstream.status)
-          continue
-        }
-        // 成功：透传 SSE（上游恒为流式）
-        res.writeHead(upstream.status, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          Connection: 'keep-alive',
-          'X-Accel-Buffering': 'no',
-        })
-        if (!upstream.body) {
-          res.end()
-          return true
-        }
-        const reader = upstream.body.getReader()
-        try {
-          for (;;) {
-            const { done, value } = await reader.read()
-            if (done) break
-            res.write(Buffer.from(value))
-            if (typeof (res as { flushHeaders?: () => void }).flushHeaders === 'function') {
-              ;(res as { flushHeaders: () => void }).flushHeaders()
-            }
-          }
-        } finally {
-          reader.releaseLock()
-        }
-        res.end()
-        return true
+      // 刷新失败继续用旧 token（token 过期由上游返回码体现）
+      let fresh = cred
+      try {
+        fresh = await refreshIfNeeded(uid, cred)
+      } catch {
+        // 保持原样
       }
-      log(`codebuddy chat failed: ${lastErr}`)
-      return false
+
+      let upstream: Response
+      try {
+        upstream = await fetch(CHAT_URL, {
+          method: 'POST',
+          headers: headers(fresh.accessToken, { 'Content-Type': 'application/json' }),
+          body,
+          signal: AbortSignal.timeout(120000),
+        })
+      } catch (err) {
+        lastErr = (err as Error).message
+        return { ok: false, state: 'transport', message: lastErr }
+      }
+      if (upstream.status < 200 || upstream.status >= 300) {
+        const text = await upstream.text().catch(() => '')
+        lastErr = gatewayError(text, upstream.status)
+        const state: AccountState =
+          upstream.status === 429 ? 'rate_limit'
+            : upstream.status === 401 || upstream.status === 403 ? 'session_dead'
+              : upstream.status === 404 ? 'unavailable'
+                : 'unknown'
+        return { ok: false, state, message: lastErr }
+      }
+      // 上游恒为流式：原样交回核心写
+      if (!upstream.body) {
+        lastErr = 'codebuddy upstream: empty stream body'
+        return { ok: false, state: 'transport', message: lastErr }
+      }
+      return { ok: true, stream: upstream.body }
     },
     dispose: (): void => {
-      cooling.clear()
+      creditsCache.clear()
     },
   }
 }

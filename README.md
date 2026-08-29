@@ -8,9 +8,9 @@ DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `co
 
 - **OAuth 轮询登录**：生成登录链接 → 浏览器登录 → 后台轮询 token（每 5s，最多 5 分钟），自动落盘凭证
 - **内置模型列表**：上游无公开 models 接口，模型列表取自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json + 9router 实际使用记录，只保留各系列最新版本（DeepSeek-V4 / GLM-5.2 / MiniMax-M3 / Kimi-K2.7 / Hy4+Hy3 / Hunyuan-2.0），面板「可用模型」自动出现；仍可在面板手动添加自定义模型
-- **连接池**：多账号按池顺序/策略（`fallback` / `round-robin`）回退，失败冷却 60s
+- **连接池**：多账号由 dsh-router 核心按池顺序/策略（`fallback` / `round-robin`）选号回退；本插件只报告单个账号的成败与语义状态，冷却/禁用/连续错误累计都由核心处置
 - **token 自动刷新**：到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token
-- **签到领积分**：面板「签到」按 dsh-router 的签到规则（`all` 所有链接 / `first` 首个）逐个签到，每日 100 积分（连续第 7 天 1000）；已签到上游返回 `code=10001`（HTTP 400 + 该码），幂等视为成功
+- **签到领积分**：面板「签到」由 dsh-router 核心遍历所有链接逐个调用，每日 100 积分（连续第 7 天 1000）；已签到上游返回 `code=10001`（HTTP 400 + 该码），幂等视为成功
 - **积分显示**：面板账号积分 = `get-user-resource` 各额度包的**剩余**求和（`CapacityRemain`，会续期的基础包取 `CycleCapacityRemain`），10 分钟缓存，签到后自动刷新。注意 `TotalDosage` 是**累计已消耗**，不是剩余
 
 ## 安装(DSH)
@@ -36,7 +36,7 @@ dsh plugin --profile web add dsh-router-codebuddy
 ```
 src/
   index.ts     插件入口（host 半，通过 cordis service router.suppliers 暴露供应商工厂表）
-  plugin.ts    codebuddy 供应商实现（OAuth 登录、chat 代理、token 刷新、连接池）
+  plugin.ts    codebuddy 供应商实现（OAuth 登录、单账号 chat、token 刷新）
   contract.ts  供应商契约（自含，与 dsh-router 契约同步）
   types.ts     通用类型（SupplierStatus / ChatRequest 等）
 cordis.patch.yml  bundle patch，把插件插入 DSH cordis bundle stack
@@ -51,14 +51,18 @@ cordis.patch.yml  bundle patch，把插件插入 DSH cordis bundle stack
 
 ## 上游
 
-- **chat**：`POST /v2/chat/completions`（强制流式，非流式上游拒绝；失败冷却 60s 按池换号回退，透传 SSE）
+- **chat**：`POST /v2/chat/completions`（强制流式，非流式上游拒绝；转成 OpenAI SSE 交回核心写，成败与语义状态报给核心换号）
 - **登录**：`POST /v2/plugin/auth/state` 生成链接 → 浏览器登录 → 轮询 `GET /v2/plugin/auth/token?state=...`（每 5s，最多 5 分钟）换 token 落盘
 - **刷新**：`POST /v2/plugin/auth/token/refresh`（`X-Refresh-Token` 头，到期前 24 小时内触发）
 - 凭证：`auths/codebuddy/{uid}.json`（`{nickname, accessToken, refreshToken, expiresAt}`）
 
 ## 架构
 
-通过 cordis service `router.suppliers` 的**共享聚合表**向 dsh-router 注册 `codebuddy` 供应商工厂（cordis 每个 service name 只允许一个插件 `provide`，本插件 `inject` 等其它插件先提供该表后追加并广播 `internal/service` 触发重扫，与加载顺序无关）。只实现差异化能力（登录 / chat / token 刷新），连接池、模型管理、别名、凭证等通用能力由 dsh-router 核心统一管。
+通过 cordis service `router.suppliers` 的**共享聚合表**向 dsh-router 注册 `codebuddy` 供应商工厂（cordis 每个 service name 只允许一个插件 `provide`，本插件 `inject` 等其它插件先提供该表后追加并广播 `internal/service` 触发重扫，与加载顺序无关）。只实现差异化能力（登录 / **单账号** chat / token 刷新 / 签到 / 积分）。
+
+分工边界：`chatOnce(uid, req)` 一次只服务一个账号，**不遍历账号、不维护冷却表、
+不写响应**——选号、冷却、禁用、连续错误累计、响应写入全是 dsh-router 核心
+`AccountPool` 的活。同理，签到也是核心遍历所有链接、本插件只签一个 uid。
 
 ## 构建
 
