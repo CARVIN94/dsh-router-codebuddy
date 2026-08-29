@@ -389,12 +389,12 @@ export default function factory(env: SupplierEnv): SupplierModule {
       const base = stripAlias(req.model, currentAlias())
       if (base === '') {
         lastErr = `unknown model ${JSON.stringify(req.model)}`
-        return { ok: false, state: 'unavailable', message: lastErr }
+        return { ok: false, state: 'no_such_model', message: lastErr }
       }
       const cred = getCred(uid)
       if (cred === undefined) {
         lastErr = `unknown account ${JSON.stringify(uid)}`
-        return { ok: false, state: 'unavailable', message: lastErr }
+        return { ok: false, state: 'no_such_model', message: lastErr }
       }
 
       // CodeBuddy 只支持流式：非流式请求也强制 stream:true（9router 同）
