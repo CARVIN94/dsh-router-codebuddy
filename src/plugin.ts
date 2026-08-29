@@ -29,7 +29,6 @@ const UA = 'CLI/2.108.1 CodeBuddy/2.108.1'
 const POLL_INTERVAL_MS = 5000
 const POLL_TIMEOUT_MS = 5 * 60 * 1000
 /** 默认前缀（用户可在面板改；loader 包装会优先用 store 里的值）。 */
-const DEFAULT_ALIAS = 'cbcn'
 const REFRESH_SKEW_MS = 24 * 3600_000 // 到期前 24 小时内刷新（同 traework）
 
 // 签到与积分（实测：POST body '{}'，Bearer accessToken）
@@ -139,7 +138,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
 
   /** 当前前缀（与 loader 包装一致：store 覆盖默认值）。 */
   function currentAlias(): string {
-    return env.store.get(id).alias || DEFAULT_ALIAS
+    return env.store.get(id).alias || id
   }
 
 
@@ -298,7 +297,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
       return r
     },
     listModels: (): ModelInfo[] => BUILTIN_MODELS, // 内置模型列表(来自 WorkBuddy.app product.json),用户仍可自定义
-    getAlias: (): string => 'cbcn',
+    getAlias: (): string => id,
     /** OAuth 轮询登录：POST state → 返回 authUrl（浏览器打开），后台轮询 token。 */
     generateLoginUrl: async (): Promise<{ ok: boolean; error?: string; loginUrl?: string }> => {
       try {
