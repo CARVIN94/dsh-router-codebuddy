@@ -1,6 +1,6 @@
 {
   "name": "dsh-router-codebuddy",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "DSH plugin: CodeBuddy supplier for dsh-router. Provides the codebuddy supplier (OAuth login, OpenAI-compatible chat gateway) to dsh-router through the router.suppliers cordis service.",
   "repository": {
     "type": "git",
