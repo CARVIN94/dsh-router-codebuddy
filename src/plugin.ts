@@ -436,11 +436,25 @@ export default function factory(env: SupplierEnv): SupplierModule {
       if (upstream.status < 200 || upstream.status >= 300) {
         const text = await upstream.text().catch(() => '')
         lastErr = gatewayError(text, upstream.status)
+        // 上游网关错误常是 HTTP 400 包一个语义 code（如 11133 请求参数非法、
+        // 11134 模型提供方临时不可用）。HTTP 状态只够粗分，这几个网关 code
+        // 得单独认——否则一律归 `unknown` 计连续错误，攒够 3 次就把整个池
+        // 冷却掉（今日 10min 断流正是这么来的）。
+        let gwCode: number | undefined
+        try {
+          const j = JSON.parse(text) as { code?: number }
+          gwCode = typeof j.code === 'number' ? j.code : undefined
+        } catch {
+          // 非 JSON：靠 HTTP 状态分类
+        }
         const state: AccountState =
           upstream.status === 429 ? 'rate_limit'
             : upstream.status === 401 || upstream.status === 403 ? 'session_dead'
               : upstream.status === 404 ? 'unavailable'
-                : 'unknown'
+                // 11133（请求参数非法）/11134（上游临时不可用）都是瞬时/请求类，
+                // 归 rate_limit = 单号短冷却换号，别攒错误把整个池打垮。
+                : gwCode === 11133 || gwCode === 11134 ? 'rate_limit'
+                  : 'unknown'
         return { ok: false, state, message: lastErr }
       }
       // 上游恒为流式：原样交回核心写
