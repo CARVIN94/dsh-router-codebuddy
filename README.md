@@ -43,7 +43,7 @@ dsh plugin --profile web add dsh-router-codebuddy
 | 连接池 | 多账号由核心按池顺序/策略（`fallback` / `round-robin`）选号回退，本插件只报告单个账号的成败与语义状态。 |
 | token 自动刷新 | 到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token。 |
 | 签到领积分 | 每日 100 积分（连续第 7 天 1000），核心遍历所有链接逐个调用。已签到上游返回 `code=10001`（HTTP 400 + 该码），幂等视为成功。 |
-| 积分显示 | 面板账号积分 = `get-user-resource` 各额度包的**剩余**求和（`CapacityRemain`，会续期的基础包取 `CycleCapacityRemain`），10 分钟缓存，签到后自动刷新。注意 `TotalDosage` 是**累计已消耗**，不是剩余。 |
+| 积分显示 | 面板账号积分 = `get-user-resource` 各额度包的**剩余**求和（`CapacityRemain`，会续期的基础包取 `CycleCapacityRemain`），内存缓存 10 分钟，签到后自动刷新。注意 `TotalDosage` 是**累计已消耗**，不是剩余。积分的**持久化由核心统一做**（`supplier-config.json`），本插件拿不到时报 `-1` 让核心顶上次的值。 |
 
 ## 使用
 
@@ -72,6 +72,7 @@ dsh plugin --profile web add dsh-router-codebuddy
 - 失败时返回语义状态（`rate_limit` / `quota` / `session_dead` / `unavailable` /
   `transport` / `unknown`），由核心决定冷却多久、是否禁用、要不要换号
 - `status()` 只报「现在状态」（凭证 + 积分），冷却/禁用由核心叠加后给面板
+- 积分只报**值**，不落盘：拿不到时报 `-1`（不是 0），核心保留上次持久化的值
 
 完整契约见 [dsh-router 的 `docs/suppliers.md`](https://github.com/CARVIN94/dsh-router/blob/main/docs/suppliers.md)。
 

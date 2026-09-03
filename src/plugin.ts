@@ -45,6 +45,12 @@ const DAILY_CHECKIN_URL = `${BASE}/billing/meter/daily-checkin`
 /** 今日已签到（幂等，视为成功）。 */
 const ALREADY_CHECKED_IN_CODE = 10001
 const CREDITS_TTL_MS = 10 * 60 * 1000 // 积分缓存 10 分钟
+/**
+ * 拿不到积分时报它（**不是 0**）：核心靠这个区分「没拿到」和「拿到了 0」，
+ * 从而保留上次持久化的值。报 0 会把缓存冲成 0 —— 重启后面板永久显示 0
+ * 积分就是这么来的。
+ */
+const CREDITS_UNKNOWN = -1
 /** 周期结束距资源到期 >2 天 = 会续期的基础包(Refill)，否则是一次性赠送包(Bonus)。 */
 const REFILL_GAP_MS = 2 * 24 * 60 * 60 * 1000
 
@@ -136,8 +142,11 @@ export default function factory(env: SupplierEnv): SupplierModule {
 
   /** 上次 chatOnce 失败原因（供核心测试模型汇总诊断）。 */
   let lastErr: string | undefined
-  /** 积分缓存：uid → { value, at }（status() 同步返回，过期后台异步刷新）。 */
+  /** 积分缓存：uid → { value, at }（status() 同步返回，过期后台异步刷新）。
+   *  积分本身由核心持久化（supplier-config.json），这里只管内存 TTL。 */
   const creditsCache = new Map<string, { value: number; at: number }>()
+  /** 正在拉积分的 uid：并发 status() 共享同一次请求，别把上游按 N 倍打。 */
+  const creditsInflight = new Set<string>()
   /** 上游拉到的模型（拉取失败时回退它，避免面板空模型）。 */
   let modelsCache: ModelInfo[] | undefined
   /** 正在进行的拉取：并发调用共享同一次请求，别把上游按 N 倍打。 */
@@ -239,6 +248,16 @@ export default function factory(env: SupplierEnv): SupplierModule {
    *  注意：TotalDosage 是「累计已消耗」，不是剩余额度（踩过）。
    *  Refill 包（基础体验包，周期续期）看 Cycle 字段，Bonus 包（一次性赠送）看 plain 字段。 */
   async function refreshCredits(uid: string): Promise<number | undefined> {
+    if (creditsInflight.has(uid)) return undefined
+    creditsInflight.add(uid)
+    try {
+      return await fetchCredits(uid)
+    } finally {
+      creditsInflight.delete(uid)
+    }
+  }
+
+  async function fetchCredits(uid: string): Promise<number | undefined> {
     const cred = getCred(uid)
     if (!cred) return undefined
     try {
@@ -377,7 +396,9 @@ export default function factory(env: SupplierEnv): SupplierModule {
         return {
           uid,
           nickname: cred?.nickname || 'CodeBuddy',
-          credits: cached?.value ?? 0,
+          // 没缓存过就报 -1（不是 0）：核心拿它区分「没拿到」与「拿到了 0」，
+          // 从而保留上次持久化的积分
+          credits: cached?.value ?? CREDITS_UNKNOWN,
           state: (cred === undefined ? 'session_dead' : 'ok') as AccountState,
         }
       })
@@ -554,6 +575,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
     },
     dispose: (): void => {
       creditsCache.clear()
+      creditsInflight.clear()
       modelsCache = undefined
     },
   }
