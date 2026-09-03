@@ -141,7 +141,6 @@ export default function factory(env: SupplierEnv): SupplierModule {
   let pendingUid: string | undefined
 
   /** 上次 chatOnce 失败原因（供核心测试模型汇总诊断）。 */
-  let lastErr: string | undefined
   /** 积分缓存：uid → { value, at }（status() 同步返回，过期后台异步刷新）。
    *  积分本身由核心持久化（supplier-config.json），这里只管内存 TTL。 */
   const creditsCache = new Map<string, { value: number; at: number }>()
@@ -412,7 +411,6 @@ export default function factory(env: SupplierEnv): SupplierModule {
     },
     /** 从上游 /v3/config 拉模型（force=true 由「获取模型」按钮触发）。 */
     listModels: (force?: boolean): Promise<ModelInfo[]> => allModels(!!force),
-    getAlias: (): string => id,
     /** OAuth 轮询登录：POST state → 返回 authUrl（浏览器打开），后台轮询 token。 */
     generateLoginUrl: async (): Promise<{ ok: boolean; error?: string; loginUrl?: string }> => {
       try {
@@ -497,18 +495,17 @@ export default function factory(env: SupplierEnv): SupplierModule {
       creds.remove(id, uid)
       return Promise.resolve(true)
     },
-    lastError: (): string | undefined => lastErr,
     /** 对单个账号调一次上游。选号/冷却/换号是核心的活，这里只报结果。 */
     async chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult> {
       const base = stripAlias(req.model, currentAlias())
       if (base === '') {
-        lastErr = `unknown model ${JSON.stringify(req.model)}`
-        return { ok: false, state: 'no_such_model', message: lastErr }
+        const msg = `unknown model ${JSON.stringify(req.model)}`
+        return { ok: false, state: 'no_such_model', message: msg }
       }
       const cred = getCred(uid)
       if (cred === undefined) {
-        lastErr = `unknown account ${JSON.stringify(uid)}`
-        return { ok: false, state: 'no_such_model', message: lastErr }
+        const msg = `unknown account ${JSON.stringify(uid)}`
+        return { ok: false, state: 'no_such_model', message: msg }
       }
 
       // CodeBuddy 只支持流式：非流式请求也强制 stream:true（9router 同）
@@ -539,12 +536,12 @@ export default function factory(env: SupplierEnv): SupplierModule {
           signal: AbortSignal.timeout(120000),
         })
       } catch (err) {
-        lastErr = (err as Error).message
-        return { ok: false, state: 'transport', message: lastErr }
+        const msg = (err as Error).message
+        return { ok: false, state: 'transport', message: msg }
       }
       if (upstream.status < 200 || upstream.status >= 300) {
         const text = await upstream.text().catch(() => '')
-        lastErr = gatewayError(text, upstream.status)
+        const gwErr = gatewayError(text, upstream.status)
         // 上游网关错误常是 HTTP 400 包一个语义 code（如 11133 请求参数非法、
         // 11134 模型提供方临时不可用）。HTTP 状态只够粗分，这几个网关 code
         // 得单独认——否则一律归 `unknown` 计连续错误，攒够 3 次就把整个池
@@ -564,12 +561,12 @@ export default function factory(env: SupplierEnv): SupplierModule {
                 // 归 rate_limit = 单号短冷却换号，别攒错误把整个池打垮。
                 : gwCode === 11133 || gwCode === 11134 ? 'rate_limit'
                   : 'unknown'
-        return { ok: false, state, message: lastErr }
+        return { ok: false, state, message: gwErr }
       }
       // 上游恒为流式：原样交回核心写
       if (!upstream.body) {
-        lastErr = 'codebuddy upstream: empty stream body'
-        return { ok: false, state: 'transport', message: lastErr }
+        const msg = 'codebuddy upstream: empty stream body'
+        return { ok: false, state: 'transport', message: msg }
       }
       return { ok: true, stream: upstream.body }
     },
