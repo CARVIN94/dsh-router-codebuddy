@@ -39,7 +39,7 @@ dsh plugin --profile web add dsh-router-codebuddy
 | 能力 | 说明 |
 |---|---|
 | OAuth 轮询登录 | 生成登录链接 → 浏览器登录 → 后台轮询 token（每 5s，最多 5 分钟），自动落盘凭证。无粘贴回调步骤。 |
-| 内置模型列表 | 上游无公开 models 接口，列表取自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json + 9router 实际使用记录，只保留各系列最新版本（DeepSeek-V4 / GLM-5.2 / MiniMax-M3 / Kimi-K2.7 / Hy4+Hy3 / Hunyuan-2.0）；仍可手动添加自定义模型。 |
+| 模型列表 | 「获取模型」从上游 `GET /v3/config` 实时拉取（带账号 token，服务端下发，GLM-5.3 / Kimi-K3 这类新模型上游一上线就能刷出来）；上游不可达时回退内置兜底表；仍可手动添加自定义模型。 |
 | 连接池 | 多账号由核心按池顺序/策略（`fallback` / `round-robin`）选号回退，本插件只报告单个账号的成败与语义状态。 |
 | token 自动刷新 | 到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token。 |
 | 签到领积分 | 每日 100 积分（连续第 7 天 1000），核心遍历所有链接逐个调用。已签到上游返回 `code=10001`（HTTP 400 + 该码），幂等视为成功。 |
@@ -50,9 +50,16 @@ dsh plugin --profile web add dsh-router-codebuddy
 1. 重启 `dsh web`
 2. 面板 → 供应商 → CodeBuddy 卡片 → 添加链接 → 浏览器登录 → 完成添加
 
-新增的 CodeBuddy 账号会出现在面板账号池中；模型列表已内置（自动出现在面板
-「可用模型」），仍可手动添加自定义模型。`/v1/chat/completions` 请求模型可写
-`glm-5.2` 或带别名前缀 `cbcn/glm-5.2`（插件自动剥前缀）。
+新增的 CodeBuddy 账号会出现在面板账号池中；模型在供应商详情页点「获取模型」从上游
+拉取（列表随服务端下发更新，无需升级插件），仍可手动添加自定义模型。
+`/v1/chat/completions` 请求模型可写 `glm-5.3-flash` 或带别名前缀
+`codebuddy/glm-5.3-flash`（插件自动剥前缀）。
+
+> **模型从哪来**：`GET https://copilot.tencent.com/v3/config` —— CodeBuddy 官方客户端
+> 取云端产品配置的同一接口。它不鉴权也返回 200，但 `data.models` 只有在带账号
+> accessToken 时才下发；所以必须**先添加链接再点获取模型**，没账号时只会拿到内置兜底表。
+> 回包里的生图/视频模型（`tags` 含 `text-to-image` 等）走不了 `/v2/chat/completions`，
+> 会被过滤掉。
 
 ## 与核心的分工
 
@@ -71,6 +78,7 @@ dsh plugin --profile web add dsh-router-codebuddy
 ## 上游
 
 - **chat**：`POST /v2/chat/completions`（强制流式，非流式上游拒绝；转成 OpenAI SSE 交回核心写，成败与语义状态报给核心换号）
+- **模型**：`GET /v3/config` → `data.models[]`（`id` / `maxInputTokens` / `tags`）；不鉴权也 200 但 `models` 为 null，必须带账号 token
 - **登录**：`POST /v2/plugin/auth/state` 生成链接 → 浏览器登录 → 轮询 `GET /v2/plugin/auth/token?state=...`（每 5s，最多 5 分钟）换 token 落盘
 - **刷新**：`POST /v2/plugin/auth/token/refresh`（`X-Refresh-Token` 头，到期前 24 小时内触发）
 - 凭证：`auths/codebuddy/{uid}.json`（`{nickname, accessToken, refreshToken, expiresAt}`）

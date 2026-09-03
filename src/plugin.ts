@@ -48,28 +48,40 @@ const CREDITS_TTL_MS = 10 * 60 * 1000 // 积分缓存 10 分钟
 /** 周期结束距资源到期 >2 天 = 会续期的基础包(Refill)，否则是一次性赠送包(Bonus)。 */
 const REFILL_GAP_MS = 2 * 24 * 60 * 60 * 1000
 
+/**
+ * 模型来源：`GET /v3/config`（WorkBuddy/CodeBuddy 官方客户端取云端产品配置的接口，
+ * 带账号 token 才下发 `data.models`；不带 token 返回 `models: null`）。
+ * 所以「获取模型」是真的拉上游，不再写死。
+ *
+ * 兜底：上游挂了/没账号时用下面这份内置列表（取自官方客户端 product.json 的
+ * 聊天模型，各系列最新版本）。用户仍可在面板添加自定义模型。
+ */
+const CONFIG_URL = `${BASE}/v3/config`
+/** 非聊天模型（生图/视频等）：网关 /v2/chat/completions 不支持，面板不该出现。 */
+const NON_CHAT_TAGS = /text-to-image|image-to-image|text-to-video|image-to-video/i
+/**
+ * 兜底模型列表：不是「当前可用模型」，只是上游 /v3/config 拿不到时的最后退路。
+ * 注意保持精简——用户面板里的自定义模型和这份列表是并集。
+ */
+const FALLBACK_MODELS: ModelInfo[] = [
+  { id: 'deepseek-v4-pro', context_length: 1000000 },
+  { id: 'deepseek-v4-flash', context_length: 1000000 },
+  { id: 'glm-5.3', context_length: 1000000 },
+  { id: 'glm-5.3-flash', context_length: 1000000 },
+  { id: 'glm-5.2', context_length: 1000000 },
+  { id: 'minimax-m3', context_length: 512000 },
+  { id: 'kimi-k3-1', context_length: 1000000 },
+  { id: 'kimi-k2.7', context_length: 256000 },
+  { id: 'hy4-preview', context_length: 1000000 },
+  { id: 'hy3', context_length: 192000 },
+  { id: 'hunyuan-chat', context_length: 200000 },
+]
+
 /** 取数值：优先 Precise 字符串字段（精确），回落到数字字段。 */
 function precise(preciseValue: unknown, plain: unknown): number {
   const n = Number(preciseValue ?? plain)
   return Number.isFinite(n) ? n : 0
 }
-
-/** 模型来源：CodeBuddy 上游无公开 models 接口（copilot.tencent.com 不暴露），
- * 内置模型列表来自 WorkBuddy.app（CodeBuddy 官方桌面客户端）的 product.json +
- * 9router 实际使用记录（hy4/hy4-preview 由服务器下发，本地 product.json 没有）。
- * 只保留各系列最新版本（v4 / 5.2 / M3 / K2.7 / Hy4 / Hunyuan-2.0）。
- * 用户在面板仍可添加自定义模型。 */
-const BUILTIN_MODELS: ModelInfo[] = [
-  { id: 'deepseek-v4-pro', context_length: 1000000 },
-  { id: 'deepseek-v4-flash', context_length: 1000000 },
-  { id: 'glm-5.2', context_length: 200000 },
-  { id: 'minimax-m3-play', context_length: 512000 },
-  { id: 'kimi-k2.7-code', context_length: 256000 },
-  { id: 'hy4-preview', context_length: 192000 },
-  { id: 'hy4', context_length: 192000 },
-  { id: 'hy3-preview', context_length: 192000 },
-  { id: 'hunyuan-2.0-thinking', context_length: 128000 },
-]
 
 interface CodeBuddyCred {
   nickname: string
@@ -126,6 +138,10 @@ export default function factory(env: SupplierEnv): SupplierModule {
   let lastErr: string | undefined
   /** 积分缓存：uid → { value, at }（status() 同步返回，过期后台异步刷新）。 */
   const creditsCache = new Map<string, { value: number; at: number }>()
+  /** 上游拉到的模型（拉取失败时回退它，避免面板空模型）。 */
+  let modelsCache: ModelInfo[] | undefined
+  /** 正在进行的拉取：并发调用共享同一次请求，别把上游按 N 倍打。 */
+  let inflight: Promise<ModelInfo[]> | undefined
 
   function listUids(): string[] {
     return creds.list(id)
@@ -145,6 +161,77 @@ export default function factory(env: SupplierEnv): SupplierModule {
   /** 当前前缀（与 loader 包装一致：store 覆盖默认值）。 */
   function currentAlias(): string {
     return env.store.get(id).alias || id
+  }
+
+  /**
+   * 从一个账号拉上游模型列表（/v3/config）。
+   *
+   * 用哪个账号都行（实测同一租户下发的列表一致），所以只取第一个能用的凭证：
+   * 遍历所有账号只会把上游按 N 倍打，换不来更多信息。
+   */
+  async function fetchModelsFromUpstream(): Promise<ModelInfo[]> {
+    for (const uid of orderedUids()) {
+      const cred = getCred(uid)
+      if (cred === undefined) continue
+      let token = cred.accessToken
+      try {
+        token = (await refreshIfNeeded(uid, cred)).accessToken
+      } catch {
+        // 刷新失败继续用旧 token：过期由上游返回码体现
+      }
+      try {
+        const resp = await fetch(CONFIG_URL, {
+          method: 'GET',
+          headers: headers(token),
+          signal: AbortSignal.timeout(15000),
+        })
+        if (!resp.ok) continue
+        const j = (await resp.json()) as {
+          code?: number
+          data?: { models?: Array<{ id?: string; maxInputTokens?: number; tags?: string[] }> }
+        }
+        if (j.code !== 0) continue
+        const raw = j.data?.models
+        if (!Array.isArray(raw)) continue
+        const out: ModelInfo[] = []
+        const seen = new Set<string>()
+        for (const m of raw) {
+          if (typeof m.id !== 'string' || m.id === '' || seen.has(m.id)) continue
+          // 生图/视频模型走不了 /v2/chat/completions，面板列出来只会误导
+          if (m.tags !== undefined && m.tags.some((t) => NON_CHAT_TAGS.test(t))) continue
+          seen.add(m.id)
+          // 上下文长度只认 maxInputTokens：maxAllowedSize 是另一套口径
+          // （实测 default 模型 56000 vs 200000），优先取它会把上下文报小一截。
+          // 除以 1000 与 openrouter/nvidia 插件一致（面板按 k 显示）。
+          const ctx = Number(m.maxInputTokens)
+          out.push(Number.isFinite(ctx) && ctx > 0 ? { id: m.id, context_length: Math.round(ctx / 1000) } : { id: m.id })
+        }
+        if (out.length > 0) return out
+      } catch {
+        // 换下一个账号
+      }
+    }
+    return []
+  }
+
+  /** 模型列表：上游拉取，失败回退上次成功结果，再不济用内置兜底表。 */
+  async function allModels(force: boolean): Promise<ModelInfo[]> {
+    // 核心按 60s TTL 缓存，force=false 的频繁调用直接用缓存，别打上游
+    if (!force && modelsCache !== undefined) return modelsCache
+    if (inflight !== undefined) return inflight
+    inflight = fetchModelsFromUpstream()
+      .then((list) => {
+        if (list.length > 0) {
+          modelsCache = list
+          return list
+        }
+        return modelsCache ?? FALLBACK_MODELS
+      })
+      .catch(() => modelsCache ?? FALLBACK_MODELS)
+      .finally(() => {
+        inflight = undefined
+      })
+    return inflight
   }
 
 
@@ -302,7 +389,8 @@ export default function factory(env: SupplierEnv): SupplierModule {
       log(`codebuddy checkin ${uid}: ${r.status}${r.message === undefined ? '' : ` (${r.message})`}`)
       return r
     },
-    listModels: (): ModelInfo[] => BUILTIN_MODELS, // 内置模型列表(来自 WorkBuddy.app product.json),用户仍可自定义
+    /** 从上游 /v3/config 拉模型（force=true 由「获取模型」按钮触发）。 */
+    listModels: (force?: boolean): Promise<ModelInfo[]> => allModels(!!force),
     getAlias: (): string => id,
     /** OAuth 轮询登录：POST state → 返回 authUrl（浏览器打开），后台轮询 token。 */
     generateLoginUrl: async (): Promise<{ ok: boolean; error?: string; loginUrl?: string }> => {
@@ -466,6 +554,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
     },
     dispose: (): void => {
       creditsCache.clear()
+      modelsCache = undefined
     },
   }
 }
