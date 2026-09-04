@@ -16,7 +16,7 @@ import type { AccountState, ChatOnceResult, SupplierEnv, SupplierModule, Supplie
 
 export const id = 'codebuddy'
 export const name = 'CodeBuddy'
-export const priority = 90 // 同 9router：非免费直连，排在后面
+export const priority = -1 // 排在 traework(0) 之前
 /**
  * 面板图标（CodeBuddy 官方 logo，128×128 PNG，base64 内联）。
  *
