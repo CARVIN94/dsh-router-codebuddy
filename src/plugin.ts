@@ -496,7 +496,7 @@ export default function factory(env: SupplierEnv): SupplierModule {
       return Promise.resolve(true)
     },
     /** 对单个账号调一次上游。选号/冷却/换号是核心的活，这里只报结果。 */
-    async chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult> {
+    async chatOnce(uid: string, lv: string, req: ChatRequest): Promise<ChatOnceResult> {
       const base = stripAlias(req.model, currentAlias())
       if (base === '') {
         const msg = `unknown model ${JSON.stringify(req.model)}`
@@ -514,6 +514,15 @@ export default function factory(env: SupplierEnv): SupplierModule {
         const obj = JSON.parse(body) as Record<string, unknown>
         obj.model = base
         obj.stream = true
+        // 推理等级：CodeBuddy 要同时收到 reasoning_effort + reasoning_summary
+        // 才吐推理内容（9router #2071：无条件加会触发内容过滤）。auto/off 显式删字段。
+        if (lv !== 'auto' && lv !== '' && lv !== 'none' && lv !== 'off') {
+          obj.reasoning_effort = lv
+          obj.reasoning_summary = 'auto'
+        } else {
+          delete obj.reasoning_effort
+          delete obj.reasoning_summary
+        }
         body = JSON.stringify(obj)
       } catch {
         // 保持原样
