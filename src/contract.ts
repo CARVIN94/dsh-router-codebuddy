@@ -95,6 +95,15 @@ export interface SupplierEnv {
   log: (msg: string) => void
   store: SupplierConfigStoreLike
   credentials: CredentialStoreLike
+  /**
+   * 迟到的失败上报（可选）——**只在响应已提交之后**才用。
+   *
+   * 流式请求一旦写出第一个字节就绑死（HTTP 语义），此时上游再报错已经换不了
+   * 号、也改不了状态码。但「这个号坏了」对**后续**请求仍有用：不报上来它就会
+   * 继续留在池里被轮转选中。核心实现 = `pool.noteFailure`，按状态冷却/禁用。
+   * 插件拿不到也不用兜底：不调用就退化成今天的行为。
+   */
+  onLateFailure?: (uid: string, model: string, state: AccountState, message: string) => void
 }
 
 /** 供应商模块 —— 契约（核心必须，差异化可选）。 */
