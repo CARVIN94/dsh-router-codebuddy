@@ -537,14 +537,23 @@ export default function factory(env: SupplierEnv): SupplierModule {
       }
 
       let upstream: Response
+      // 超时只守「连接 + 响应头」：AbortSignal.timeout 会连 body 流一起封顶，
+      // 长生成超 120s 时流被中途 abort，客户端看到回复写一半就断。
+      // 改成计时器：响应头到手即撤表，生成时长不限。
+      // ponytail: 若上游接上后 body 中途停摆，现在没有任何超时会杀它，
+      // 响应会挂到客户端自己断开为止；要防这种，得在流上做空闲超时。
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(new Error('upstream connect/response timeout (120s)')), 120_000)
       try {
         upstream = await fetch(CHAT_URL, {
           method: 'POST',
           headers: headers(fresh.accessToken, { 'Content-Type': 'application/json' }),
           body,
-          signal: AbortSignal.timeout(120000),
+          signal: ctrl.signal,
         })
+        clearTimeout(timer)
       } catch (err) {
+        clearTimeout(timer)
         const msg = (err as Error).message
         return { ok: false, state: 'transport', message: msg }
       }
