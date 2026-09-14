@@ -42,10 +42,10 @@ cordis.patch.yml  bundle patch，把插件插入 DSH cordis bundle stack
 ```
 
 > **历史**：`codebuddy-en` 曾是独立的 `dsh-router-codebuddy-en` 包，两份实现复制粘贴、
-> 会各自漂移（同一个网关的两个部署，修一边忘一边）。0.4.0 起并入本包。
+> 会各自漂移（同一个网关的两个部署，修一边忘一边）。0.3.15 起并入本包。
 > **升级无感**：两个供应商 id 原样保留，而凭证（`credentials.sqlite`）与配置
 > （`supplier-config.json`）都以 supplier id 为键 —— 已登录的账号、积分缓存、模型开关全部不动。
-> 装上 0.4.0 后请把旧的 `dsh-router-codebuddy-en` 从 profile 里移除。
+> 装上 0.3.15 后请把旧的 `dsh-router-codebuddy-en` 从 profile 里移除。
 
 ## 快速安装
 
