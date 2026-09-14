@@ -7,11 +7,6 @@
  *   - `codebuddy-en` WorkBuddy 国际版（www.workbuddy.ai）
  * 两者共用 core.ts 的同一份实现，差异只在 cn.ts / en.ts 的 profile。
  *
- * 一个插件挂多个供应商是核心本就支持的形状（dsh-router 自己内置的
- * opencode/openrouter/nvidia 就是同一个包三个供应商）；合进一个包还顺带消掉了
- * 两个插件各自注册时的一个隐患：核心注销外部供应商用的是**共享**的 id 列表，
- * 任一插件卸载会把另一个的供应商一起注销。
- *
  * cordis 的 `ctx.provide` 每个 service name 只允许一个插件注册，多个供应商插件不能各自
  * provide `router.suppliers`（会抛 "service has been registered"）。本插件用共享表模式：
  * `inject` 等待该 service（由核心 dsh-router 持有空表），把工厂追加进共享表后广播一次

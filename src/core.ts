@@ -5,7 +5,7 @@
  * 是同一个腾讯网关的两个部署：契约完全一致（OAuth 轮询登录 + OpenAI 兼容流式
  * chat + billing/meter 积分签到），只差 base、路径候选、指纹头、兜底模型这几张
  * 配置表。全部共享逻辑住在这里，差异收敛进 `SupplierProfile`；cn.ts / en.ts 各给
- * 一份 profile —— 两边因此不可能再各修一半（此前是两份仓库的复制粘贴）。
+ * 一份 profile。
  *
  * 上游：OpenAI 兼容网关
  *   - chat:   POST <chatUrls[0]>（强制流式；非流式上游 400 拒绝）
@@ -33,9 +33,7 @@ export interface SupplierProfile {
   /**
    * 面板图标（内联 data URI）。
    *
-   * **必须内联，不能放网络 URL**：曾经是 `http://localhost:20128/...`（9router
-   * 的端口），9router 没跑时就是一张坏图 —— 面板图标不该依赖另一个服务活着，
-   * 更不该依赖特定端口。
+   * **必须内联，不能放网络 URL**：图标不该依赖另一个服务活着，更不该依赖特定端口。
    */
   icon: string
   /** 池内排序（越小越靠前）。 */

@@ -41,12 +41,6 @@ src/
 cordis.patch.yml  bundle patch，把插件插入 DSH cordis bundle stack
 ```
 
-> **历史**：`codebuddy-en` 曾是独立的 `dsh-router-codebuddy-en` 包，两份实现复制粘贴、
-> 会各自漂移（同一个网关的两个部署，修一边忘一边）。0.3.15 起并入本包。
-> **升级无感**：两个供应商 id 原样保留，而凭证（`credentials.sqlite`）与配置
-> （`supplier-config.json`）都以 supplier id 为键 —— 已登录的账号、积分缓存、模型开关全部不动。
-> 装上 0.3.15 后请把旧的 `dsh-router-codebuddy-en` 从 profile 里移除。
-
 ## 快速安装
 
 需要 **DSH `0.1.5-rc.1` 及以上**。先装核心，再装本插件，然后**重启 `dsh web`**：
@@ -131,10 +125,8 @@ dsh plugin --profile web add dsh-router-codebuddy
 （cordis 每个 service name 只允许一个插件 `provide`，本插件 `inject` 等核心先提供该表后
 追加并广播 `internal/service` 触发重扫，与加载顺序无关）。
 
-一个插件挂多个供应商是核心本就支持的形状（dsh-router 自己内置的
-opencode/openrouter/nvidia 就是同一个包三个供应商）。合进一个包还顺带消掉了一个隐患：
-核心注销外部供应商用的是**共享** id 列表，两个插件各自注册时，任一卸载会把另一个的
-供应商一起注销。
+两个供应商 id 即凭证与配置的存储键：凭证在 `credentials.sqlite`、配置与积分缓存在
+`supplier-config.json`，均以 supplier id 寻址，故两个供应商各自独立、互不影响。
 
 ## 开发
 
@@ -145,9 +137,9 @@ pnpm typecheck
 pnpm test         # 行为回归闸门（node --test）
 ```
 
-`src/core.test.ts` 锁的是 **profile 边界**：国内侧行为逐字保留（不多发 system、
-不动 tool_choice、只打 `/v2`）、国际侧三个接口归一仍在且顺序正确、端点回退只在
-404/405 触发、两个 id/存储键/uid 前缀不变。改 profile 改错会直接变红。
+`src/core.test.ts` 锁的是 **profile 边界**：国内侧不多发 system、不动 tool_choice、
+只打 `/v2`；国际侧三个接口归一存在且顺序正确（补 system 必须在改 role 之后）；
+端点回退只在 404/405 触发；两个 id / 存储键 / uid 前缀不变。改 profile 改错会直接变红。
 
 ## 致谢
 

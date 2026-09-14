@@ -1,12 +1,11 @@
 /**
  * codebuddy 族共享实现的回归闸门。
  *
- * 合并前 codebuddy / codebuddy-en 是两个仓库的复制粘贴，两份实现会各自漂移
- * （同一个网关的两个部署，修一边忘一边）。现在差异全部收敛进 cn.ts / en.ts 的
- * profile，共享逻辑只有 core.ts 一份 —— 本测试锁住的就是**profile 边界**：
+ * 差异全部收敛进 cn.ts / en.ts 的 profile，共享逻辑只有 core.ts 一份 ——
+ * 本测试锁住的就是**profile 边界**：
  *
- *   1. 国内侧行为逐字保留（不多发 system、不动 tool_choice、只打 /v2）；
- *   2. 国际侧三个网关归一化仍在（developer→system、tool_choice 对象→string、
+ *   1. 国内侧不多发 system、不动 tool_choice、只打 /v2；
+ *   2. 国际侧三个网关归一化存在（developer→system、tool_choice 对象→string、
  *      首条非 system 前置兜底）且**顺序正确**（补 system 必须在改 role 之后）；
  *   3. 端点候选回退只在 404/405 触发；
  *   4. 两个 id / 存储键 / uid 前缀不变 —— 改它 = 已登录账号全部消失。
@@ -141,7 +140,7 @@ test('两个供应商的 id / 名字 / 存储键逐字保留', () => {
   assert.equal(en.uidPrefix, 'wb')
   assert.equal(cn.domain, 'copilot.tencent.com')
   assert.equal(en.domain, 'www.workbuddy.ai')
-  // 图标必须内联：曾经是 http://localhost:20128/... 的坏图
+  // 图标必须内联 data URI：面板图标不该依赖另一个服务活着
   for (const p of [cn, en]) assert.match(p.icon, /^data:image\//)
 })
 
