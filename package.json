@@ -1,7 +1,7 @@
 {
   "name": "dsh-router-codebuddy",
-  "version": "0.3.14",
-  "description": "DSH plugin: CodeBuddy supplier for dsh-router. Provides the codebuddy supplier (OAuth login, OpenAI-compatible chat gateway) to dsh-router through the router.suppliers cordis service.",
+  "version": "0.4.0",
+  "description": "DSH plugin: CodeBuddy supplier family for dsh-router. Provides two same-family suppliers through the router.suppliers cordis service: codebuddy (Tencent CodeBuddy, copilot.tencent.com) and codebuddy-en (WorkBuddy international, www.workbuddy.ai). Both share one implementation; only the gateway profile differs.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/CARVIN94/dsh-router-codebuddy.git"
@@ -35,8 +35,16 @@
     "README.md",
     "LICENSE"
   ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-router",
+    "codebuddy",
+    "workbuddy"
+  ],
   "scripts": {
     "build": "rm -rf lib && tsdown",
+    "test": "node --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "license": "MIT",
