@@ -1,10 +1,11 @@
 /**
  * tsdown build for dsh-router-codebuddy — HOST half only.
  *
- * Produces `lib/index.js`: the Node host half that provides the
- * `router.suppliers` cordis service for dsh-router.
+ * Produces `lib/index.js`: the Node host half that registers the codebuddy
+ * supplier family (codebuddy + codebuddy-en) into the `router.suppliers`
+ * cordis service for dsh-router. cn/en profiles are inlined into the same
+ * bundle — one package, one mount row, two suppliers.
  */
-import { builtinModules } from 'node:module'
 import type { UserConfig } from 'tsdown'
 
 export default [
