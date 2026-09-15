@@ -11,12 +11,15 @@
  */
 import type { ModelInfo } from './types.ts'
 import type { SupplierProfile } from './core.ts'
+import { CODEBUDDY_ICON } from './icon.ts'
 
 const BASE = 'https://www.workbuddy.ai'
 
-/** 面板图标（WorkBuddy 国际版 logo，SVG data URI 内联）。 */
-const ICON =
-  "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='28' fill='%237b68ee'/><text x='50%' y='50%' dy='.35em' text-anchor='middle' font-family='Arial,Helvetica,sans-serif' font-size='52' font-weight='700' fill='white'>W</text></svg>"
+/**
+ * 面板图标 —— 与国内 CodeBuddy 同一张封面图（CodeBuddy 官方 logo，128×128 PNG，base64 内联）。
+ * 国际版 WorkBuddy 与国内同族同契约，封面图保持一致。
+ */
+const ICON = CODEBUDDY_ICON
 
 /**
  * 兜底模型列表：不是「当前可用模型」，只是上游 /v3/config 拿不到时的最后退路。

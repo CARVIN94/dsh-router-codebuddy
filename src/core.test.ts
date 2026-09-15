@@ -142,6 +142,8 @@ test('两个供应商的 id / 名字 / 存储键逐字保留', () => {
   assert.equal(en.domain, 'www.workbuddy.ai')
   // 图标必须内联 data URI：面板图标不该依赖另一个服务活着
   for (const p of [cn, en]) assert.match(p.icon, /^data:image\//)
+  // 两个供应商共用同一张封面图（CodeBuddy 官方 logo）—— 同族同封面
+  assert.equal(cn.icon, en.icon)
 })
 
 test('模块暴露契约要求的能力', () => {
