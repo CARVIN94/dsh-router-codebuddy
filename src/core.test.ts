@@ -288,13 +288,18 @@ test('国际侧 tool_choice：function 对象取函数名；none 连 tools 一�
 
 // ---------------------------------------------------------------- 网关 code 归类
 
-test('网关 code 归类按 profile 分化：11128 只在国际侧算限流', async () => {
-  assert.equal(cn.classifyGatewayCode?.(11128), undefined, '国内侧没归一化，11128 仍是 unknown')
-  assert.equal(cn.classifyGatewayCode?.(11133), 'rate_limit')
+test('网关 code 归类：请求形态错归 bad_request（不冷号），只有临时故障归 rate_limit', async () => {
+  // 11133/11135/11128 都是「这条请求有问题」——同一个请求对池里每个号都会
+  // 失败，冷号会把一次请求错误放大成「这个模型谁都别用」（2026-09-15 读图
+  // 11148/11133 事故：money 组合两条腿同时被冷 = 之后连文本也全灭 503）。
+  assert.equal(cn.classifyGatewayCode?.(11133), 'bad_request', '参数非法不是账号的错')
+  assert.equal(cn.classifyGatewayCode?.(11135), 'bad_request', '图片无法识别不是账号的错')
+  assert.equal(en.classifyGatewayCode?.(11133), 'bad_request')
+  assert.equal(en.classifyGatewayCode?.(11128), 'bad_request', '首条非 system 是请求形态问题')
+  // 11134 = 上游临时不可用，仍走瞬冷换号（有号可换时换号确实管用）
   assert.equal(cn.classifyGatewayCode?.(11134), 'rate_limit')
-  assert.equal(en.classifyGatewayCode?.(11128), 'rate_limit')
-  assert.equal(en.classifyGatewayCode?.(11133), 'rate_limit')
-  assert.equal(cn.classifyGatewayCode?.(99999), undefined)
+  assert.equal(en.classifyGatewayCode?.(11134), 'rate_limit')
+  assert.equal(cn.classifyGatewayCode?.(99999), undefined, '没枚举的 code 交给 extError.type 兜底')
 })
 
 test('429/401 的分类不受 profile 影响', async () => {
@@ -311,6 +316,46 @@ test('429/401 的分类不受 profile 影响', async () => {
     assert.equal(r.ok, false)
     assert.equal(r.ok === false ? r.state : '', want, `${p.id} @${status}`)
   }
+})
+
+/**
+ * 上游的 extError.type 是它自己打的语义标签，比枚举 code 更耐新：
+ * 将来上游加一个新的「请求形态」错误码（我们枚举不到），只要它还带
+ * invalid_request_error，就该归 bad_request 而不是 unknown 冷掉好号。
+ */
+test('未枚举的 400：extError.type=invalid_request_error → bad_request（不冷号）', async () => {
+  for (const p of [cn, en] as const) {
+    const { env, calls } = harness(p.id)
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/chat/completions')) {
+        calls.push({ url, init: init ?? {}, body: undefined })
+        return new Response(
+          JSON.stringify({ code: 11999, msg: 'brand new request error', extError: { type: 'invalid_request_error' } }),
+          { status: 400 },
+        )
+      }
+      return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+    }) as typeof fetch
+    const m = createSupplier(p)(env)
+    const r = await m.chatOnce('u1', 'auto', req)
+    assert.equal(r.ok === false ? r.state : '', 'bad_request', `${p.id} 未枚举 code + invalid_request_error`)
+  }
+})
+
+test('未枚举的 400 且没有 invalid_request_error 标签 → 仍是 unknown（保守，不放过真故障）', async () => {
+  const { env, calls } = harness(cn.id)
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes('/chat/completions')) {
+      calls.push({ url, init: init ?? {}, body: undefined })
+      return new Response(JSON.stringify({ code: 11999, msg: 'mystery' }), { status: 400 })
+    }
+    return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+  }) as typeof fetch
+  const m = createSupplier(cn)(env)
+  const r = await m.chatOnce('u1', 'auto', req)
+  assert.equal(r.ok === false ? r.state : '', 'unknown', '说不清的错仍按 unknown 处理，不误判成 bad_request')
 })
 
 // ---------------------------------------------------------------- billing 双路径

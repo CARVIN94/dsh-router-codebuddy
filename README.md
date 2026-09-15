@@ -113,7 +113,10 @@ dsh plugin --profile web add dsh-router-codebuddy
 
 - `chatOnce(uid, req)` 一次只服务一个账号，**不遍历账号、不维护冷却表、不写响应**
 - 失败时返回语义状态（`rate_limit` / `quota` / `session_dead` / `unavailable` /
-  `transport` / `unknown`），由核心决定冷却多久、是否禁用、要不要换号
+  `transport` / `unknown` / `no_such_model` / `bad_request`），由核心决定冷却多久、
+  是否禁用、要不要换号。**`bad_request` = 请求本身被上游拒（参数错 / 图片认不出 /
+  tool_call 配对断裂）**，同一个请求对池里每个号都会失败，所以核心不惩罚账号——
+  否则一次坏请求会把整个池冷掉（2026-09-15 读图事故）。
 - `status()` 只报「现在状态」（凭证 + 积分），冷却/禁用由核心叠加后给面板
 - 积分只报**值**，不落盘：拿不到时报 `-1`（不是 0），核心保留上次持久化的值
 
