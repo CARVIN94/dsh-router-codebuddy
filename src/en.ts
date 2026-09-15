@@ -175,11 +175,17 @@ export const profile: SupplierProfile = {
   defaultNickname: 'WorkBuddy',
   fallbackModels: FALLBACK_MODELS,
   chatExtraHeaders: { Accept: 'application/json, text/event-stream' },
-  // 11128（first message is not system prompt）我们已经通过 normalizeRoles +
-  // ensureConsoleSystem 在出站前规避；若仍出现，归 rate_limit = 单号短冷却换号，
-  // 别攒错误把整个池打垮。11133/11134 同国内。
-  classifyGatewayCode: (code) =>
-    code === 11128 || code === 11133 || code === 11134 ? 'rate_limit' : undefined,
+  // 11134（上游临时不可用）是瞬时故障 → 短冷换号。
+  // 11128（首条不是 system）/11133（参数非法）/11135（图片认不出）都是**请求
+  // 形态**问题，与账号无关——同一个请求对每个号结果相同，冷号无济于事。
+  // 11128 我们已经通过 normalizeRoles + ensureConsoleSystem 在出站前规避；
+  // 若仍出现，说明是这条请求的形态问题，报 bad_request 让核心换下一个，
+  // 而不是把好号冷 30 秒（2026-09-15 读图事故的同型放大）。
+  classifyGatewayCode: (code) => {
+    if (code === 11134) return 'rate_limit'
+    if (code === 11128 || code === 11133 || code === 11135) return 'bad_request'
+    return undefined
+  },
   normalizeBody: (obj) => {
     // 防网关 11128/11101：developer 角色归一为 system；tool_choice 对象形态归一为 string。
     normalizeRoles(obj)

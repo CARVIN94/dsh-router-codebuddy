@@ -613,18 +613,30 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           // 11134 模型提供方临时不可用）。HTTP 状态只够粗分，这几个网关 code
           // 得单独认——否则一律归 `unknown` 计连续错误，攒够 3 次就把整个池
           // 冷却掉（今日 10min 断流正是这么来的）。
+          //
+          // 2026-09-15 追加：**请求本身非法**（`extError.type =
+          // invalid_request_error`，如 11133 参数不符 / 11135 图片认不出 /
+          // 11148 tool_call 配对断裂）不是账号的错——同一个请求对池里每个号
+          // 都会失败。归 rate_limit 冷号会把「这条请求有问题」放大成「这个
+          // 模型 30 秒内谁都别用」，组合两条腿同时被冷就是全灭 503 的成因。
+          // 所以这类报 `bad_request`（核心不惩罚账号，直接换下一个）。
           let gwCode: number | undefined
+          let extType: string | undefined
           try {
-            const j = JSON.parse(text) as { code?: number }
+            const j = JSON.parse(text) as { code?: number; extError?: { type?: unknown } }
             gwCode = typeof j.code === 'number' ? j.code : undefined
+            extType = typeof j.extError?.type === 'string' ? j.extError.type : undefined
           } catch {
             // 非 JSON：靠 HTTP 状态分类
           }
+          // 明确认得的 code 优先（如 11134 是上游临时不可用，仍走 rate_limit
+          // 短冷换号）；两家里未枚举的新 code 才落到 extError.type 兜底。
+          const byCode = gwCode === undefined ? undefined : p.classifyGatewayCode?.(gwCode)
           const state: AccountState =
             upstream.status === 429 ? 'rate_limit'
               : upstream.status === 401 || upstream.status === 403 ? 'session_dead'
                 : upstream.status === 404 ? 'unavailable'
-                  : (gwCode === undefined ? undefined : p.classifyGatewayCode?.(gwCode)) ?? 'unknown'
+                  : byCode ?? (extType === 'invalid_request_error' ? 'bad_request' : 'unknown')
           return { ok: false, state, message: gwErr }
         }
         // 上游恒为流式：原样交回核心写

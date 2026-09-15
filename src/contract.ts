@@ -57,6 +57,9 @@ export type AccountState =
    *  而不是记在账号头上——否则组合里每有一个别人家的模型，就会给无关账号攒
    *  一次错误，攒够阈值把它冷却掉。 */
   | 'no_such_model'
+  /** 请求本身不合法被上游拒（参数错/图片认不出/tool_call 配对断裂）——同一个
+   *  请求对每个号都一样失败，不是账号的错。核心不惩罚账号，直接换下一个。 */
+  | 'bad_request'
 
 /** 账号「现在状态」（插件只报它观察到的部分）。 */
 export interface SupplierAccountNow {

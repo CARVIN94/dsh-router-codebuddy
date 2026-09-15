@@ -66,7 +66,13 @@ export const profile: SupplierProfile = {
   uidPrefix: 'cb',
   defaultNickname: 'CodeBuddy',
   fallbackModels: FALLBACK_MODELS,
-  // 11133（请求参数非法）/11134（上游临时不可用）都是瞬时/请求类，
-  // 归 rate_limit = 单号短冷却换号，别攒错误把整个池打垮。
-  classifyGatewayCode: (code) => (code === 11133 || code === 11134 ? 'rate_limit' : undefined),
+  // 11134（上游临时不可用）是瞬时故障 → 短冷换号，别攒错误把整个池打垮。
+  // 11133（请求参数非法）/11135（图片无法识别）**不是账号的错**：同一个请求
+  // 对每个号都一样失败，冷号 = 把一次「请求有问题」放大成「这个模型谁都别用」
+  // （2026-09-15 读图 11148/11133 事故）。归 bad_request，核心不惩罚账号。
+  classifyGatewayCode: (code) => {
+    if (code === 11134) return 'rate_limit'
+    if (code === 11133 || code === 11135) return 'bad_request'
+    return undefined
+  },
 }
