@@ -1,6 +1,6 @@
 {
   "name": "dsh-router-codebuddy",
-  "version": "0.3.16",
+  "version": "0.3.16-1",
   "description": "DSH plugin: CodeBuddy supplier family for dsh-router. Provides two same-family suppliers through the router.suppliers cordis service: codebuddy (Tencent CodeBuddy, copilot.tencent.com) and codebuddy-en (WorkBuddy international, www.workbuddy.ai). Both share one implementation; only the gateway profile differs.",
   "repository": {
     "type": "git",
