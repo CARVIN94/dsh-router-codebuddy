@@ -29,11 +29,11 @@ interface Call {
 const FAR_FUTURE = Date.now() + 365 * 24 * 3600_000
 
 /** 造一个假 env + 可编程的 fetch。 */
-function harness(id: string, opts: { creds?: boolean } = {}) {
+function harness(id: string, opts: { creds?: boolean; cred?: Record<string, unknown> } = {}) {
   const calls: Call[] = []
   const creds = new Map<string, unknown>()
   if (opts.creds !== false) {
-    creds.set('u1', { nickname: 'N', accessToken: 'tok', refreshToken: 'ref', expiresAt: FAR_FUTURE })
+    creds.set('u1', opts.cred ?? { nickname: 'N', accessToken: 'tok', refreshToken: 'ref', expiresAt: FAR_FUTURE })
   }
   const env: SupplierEnv = {
     dataDir: '/tmp',
@@ -387,4 +387,42 @@ test('未知账号与未知模型报 no_such_model（不记在账号头上）', 
   const unknownAcct = await m.chatOnce('nope', 'auto', req)
   assert.equal(unknownAcct.ok === false && unknownAcct.state, 'no_such_model')
   assert.equal(calls.length, 0, '不该打上游')
+})
+
+// ---------------------------------------------------------------- token 主动刷新轮换
+
+/** 造一个带指定 iat（Unix 秒）的假 JWT accessToken。 */
+function makeToken(iatSec: number): string {
+  const b64 = (s: string): string => Buffer.from(s).toString('base64').replace(/=+$/, '')
+  // 只用 payload 里的 iat；签名部分留空即可（本插件只解 iat，不验签）
+  return `${b64('{"alg":"RS256","typ":"JWT"}')}.${b64(JSON.stringify({ iat: iatSec }))}.sig`
+}
+
+test('签发超过 15 天的 token：chat 前先走 refresh 轮换', async () => {
+  const iat = Math.floor((Date.now() - 16 * 24 * 3600_000) / 1000)
+  const cred = { nickname: 'N', accessToken: makeToken(iat), refreshToken: 'ref', expiresAt: FAR_FUTURE }
+  const { env, calls } = harness(cn.id, { cred })
+  const m = createSupplier(cn)(env)
+  await m.chatOnce('u1', 'auto', req)
+  const ref = calls.filter((c) => c.url.includes('/token/refresh'))
+  assert.equal(ref.length, 1, '签发久远应该在发 chat 前刷新一次')
+})
+
+test('签发 1 天且未临到期：不主动刷新（保持旧行为）', async () => {
+  const iat = Math.floor((Date.now() - 24 * 3600_000) / 1000)
+  const cred = { nickname: 'N', accessToken: makeToken(iat), refreshToken: 'ref', expiresAt: FAR_FUTURE }
+  const { env, calls } = harness(cn.id, { cred })
+  const m = createSupplier(cn)(env)
+  await m.chatOnce('u1', 'auto', req)
+  const ref = calls.filter((c) => c.url.includes('/token/refresh'))
+  assert.equal(ref.length, 0, '签发 1 天不该刷新')
+})
+
+test('无 iat 的 token（解不出签发时间）：回落到按 expiresAt 判，不误刷', async () => {
+  const cred = { nickname: 'N', accessToken: 'not-a-jwt', refreshToken: 'ref', expiresAt: FAR_FUTURE }
+  const { env, calls } = harness(cn.id, { cred })
+  const m = createSupplier(cn)(env)
+  await m.chatOnce('u1', 'auto', req)
+  const ref = calls.filter((c) => c.url.includes('/token/refresh'))
+  assert.equal(ref.length, 0, '解不出 iat 且未临到期，不该刷新')
 })

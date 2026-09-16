@@ -89,6 +89,16 @@ export interface SupplierProfile {
 
 /** 默认前缀（用户可在面板改；loader 包装会优先用 store 里的值）。 */
 const REFRESH_SKEW_MS = 24 * 3600_000 // 到期前 24 小时内刷新（同 traework）
+/**
+ * 主动刷新上限：accessToken 距**签发**超过这么久就刷新轮换一次，不等到临到期。
+ *
+ * 为什么需要这个：上游返回的 JWT 有效期可以很长（实测到 ~350 天）。只靠
+ * REFRESH_SKEW_MS（临到期 24h）的话，一份签发很久的旧 token 会被一直复用——
+ * 直到腾讯把它**服务端吊销**（401，刷新也报 `12153: Offline user session not
+ * found`，见 2026-06 批 cb 号实测）。定期轮换让 token 保持新鲜，避免长期复用
+ * 同一凭据被风控判成问题。15 天 = 最长刷新期诉求。
+ */
+const REFRESH_MAX_ISSUED_MS = 15 * 24 * 3600_000
 const POLL_INTERVAL_MS = 5000
 const POLL_TIMEOUT_MS = 5 * 60 * 1000
 /** 今日已签到（幂等，视为成功）。 */
@@ -116,6 +126,29 @@ interface CodeBuddyCred {
   accessToken: string
   refreshToken: string
   expiresAt: number // ms epoch
+}
+
+/**
+ * 从 JWT accessToken 的 payload 解出签发时间 `iat`（Unix 秒 → ms）。
+ * 解不出来返回 null —— 调用方应回落到仅按 `expiresAt` 判（行为与旧版一致）。
+ * Web 环境无 atob 时用 Buffer 兜底；两者都不在则视为不可解。
+ */
+function tokenIssuedAtMs(accessToken: string): number | null {
+  const dot = accessToken.split('.')
+  const payload = dot.length >= 2 ? (dot[1] ?? '') : ''
+  if (payload === '') return null
+  let json: string
+  try {
+    json = typeof Buffer !== 'undefined' ? Buffer.from(payload, 'base64').toString('utf8') : atob(payload)
+  } catch {
+    return null
+  }
+  try {
+    const j = JSON.parse(json) as { iat?: number }
+    return typeof j.iat === 'number' && Number.isFinite(j.iat) ? j.iat * 1000 : null
+  } catch {
+    return null
+  }
 }
 
 /** 网关错误：code 非 0 时提取 msg。 */
@@ -382,7 +415,11 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
 
     /** 刷新 token（若临近过期）。返回新 cred 或原样。 */
     async function refreshIfNeeded(uid: string, cred: CodeBuddyCred): Promise<CodeBuddyCred> {
-      if (Date.now() + REFRESH_SKEW_MS < cred.expiresAt) return cred
+      // 触发刷新：临到期（剩 24h 内）**或**签发超过 15 天（主动轮换保新鲜）。
+      // iat 解不出来时只按临到期判（回落到旧行为）；只要满足其一就刷。
+      const iat = tokenIssuedAtMs(cred.accessToken)
+      const issuedLongAgo = iat !== null && Date.now() - iat >= REFRESH_MAX_ISSUED_MS
+      if (!issuedLongAgo && Date.now() + REFRESH_SKEW_MS < cred.expiresAt) return cred
       if (!cred.refreshToken) return cred
       try {
         const resp = await fetch(p.refreshUrl, {
