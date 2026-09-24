@@ -612,8 +612,11 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
         // 超时只守「连接 + 响应头」：AbortSignal.timeout 会连 body 流一起封顶，
         // 长生成超 120s 时流被中途 abort，客户端看到回复写一半就断。
         // 改成计时器：响应头到手即撤表，生成时长不限。
-        // ponytail: 若上游接上后 body 中途停摆，现在没有任何超时会杀它，
-        // 响应会挂到客户端自己断开为止；要防这种，得在流上做空闲超时。
+        //
+        // body 停摆**不由插件管**：响应头一到流就交回核心了，插件没有「换号/
+        // 换模型」的能力，自己再套一层 body 超时只会把失败提前锁死在一条腿上。
+        // 核心那道闸门是 `FIRST_BYTE_BUDGET_MS`（每条降级腿 60s 首字节预算），
+        // 见 dsh-router docs/suppliers.md「首字节预算」。
         //
         // 端点候选：仅 404/405 换下一个（上游新旧路径分叉），其余状态码直接返回。
         const ctrl = new AbortController()
