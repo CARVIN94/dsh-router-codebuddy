@@ -181,9 +181,21 @@ export const profile: SupplierProfile = {
   // 11128 我们已经通过 normalizeRoles + ensureConsoleSystem 在出站前规避；
   // 若仍出现，说明是这条请求的形态问题，报 bad_request 让核心换下一个，
   // 而不是把好号冷 30 秒（2026-09-15 读图事故的同型放大）。
+  //
+  // 11102/11103 与国内侧同义（模型已下架 / 生图模型当聊天用）。
+  //
+  // **11140 `request illegal` 刻意不在这里归类**（2026-10-10 实测订正）：
+  // 它虽然带着 "The content did not pass the safety review" 的 displayMsg，
+  // 但实测是**账号级**而非内容级——同一段无害内容、不带任何 user 消息（仅 system）
+  // 也一样被拒；而同一时刻同请求换本机另外两个号（wb-2/wb-3）都能正常出字。
+  // 也就是说它描述的是「这个账号被风控了」，不是「这条请求有问题」。
+  // 归 bad_request 会让核心**跳过整个供应商、失去换号**，正好丢掉那两个可用号；
+  // 留在默认的 403 → session_dead（连接级冷却 30 分钟、到期自愈、逐号换）才对。
   classifyGatewayCode: (code) => {
     if (code === 11134) return 'rate_limit'
     if (code === 11128 || code === 11133 || code === 11135) return 'bad_request'
+    if (code === 11102) return 'no_such_model'
+    if (code === 11103) return 'bad_request'
     return undefined
   },
   normalizeBody: (obj) => {

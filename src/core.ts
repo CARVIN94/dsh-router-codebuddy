@@ -355,8 +355,16 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
       return undefined
     }
 
-    /** 单账号签到：直接签到（幂等：已签到返回 10001），成功后刷新积分缓存。
-     *  实测 checkin-status 的 today_checked_in 恒为 false（活动字段不可靠），故不预查状态。 */
+    /**
+     * 单账号签到：直接签到（幂等：已签到返回 10001），成功后刷新积分缓存。
+     *
+     * **不预查状态是刻意的，不是「状态不可信」**（2026-10-10 实测订正，此前的
+     * 注释写反了）：`checkin-activity-status` 的 `today_checked_in` 其实是可靠的——
+     * 本机 4 个 CN 账号实测一致返回 `active=true, today_checked_in=true, streak_days=11`。
+     * 之所以仍不预查，是因为上游本身按账号幂等（已签到答 `code=10001`），
+     * 多一次读只是多一次往返；国际侧那些号的 `today_checked_in=false` 也不是
+     * 字段坏了，而是**该区活动未开启**（同响应 `active=false`）——两件事别看混。
+     */
     async function checkinOne(uid: string): Promise<{ uid: string; ok: boolean; status: string; message?: string }> {
       const cred = getCred(uid)
       if (!cred) return { uid, ok: false, status: 'error', message: '凭证缺失' }
@@ -671,6 +679,13 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           }
           // 明确认得的 code 优先（如 11134 是上游临时不可用，仍走 rate_limit
           // 短冷换号）；两家里未枚举的新 code 才落到 extError.type 兜底。
+          //
+          // 注意这里的顺序**只处理认得的业务 code**：它们都随 400/500 到达，
+          // 本就会落到 `byCode`。**不要**把 byCode 提到 HTTP 状态之前——那会让
+          // 「403/429 + 某个请求级 code」变成跳过整个供应商，从而失去换号。
+          // 已实测的反例：11140 随 403 到达且**是账号级**的（同一 token 在同一
+          // host 上能读 /v3/config，同请求换 wb-2/wb-3 就成功），故必须留在
+          // session_dead 上按连接级冷却 + 换号，而不是 bad_request。
           const byCode = gwCode === undefined ? undefined : p.classifyGatewayCode?.(gwCode)
           const state: AccountState =
             upstream.status === 429 ? 'rate_limit'

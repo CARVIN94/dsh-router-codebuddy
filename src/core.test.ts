@@ -302,6 +302,79 @@ test('网关 code 归类：请求形态错归 bad_request（不冷号），只�
   assert.equal(cn.classifyGatewayCode?.(99999), undefined, '没枚举的 code 交给 extError.type 兜底')
 })
 
+/**
+ * 目录列着、实际调不动的两类「模型级」拒绝（2026-10-10 实测）。
+ *
+ * 两条都是在**全部 11 个 CN 账号**上逐号实测确认的：同一个模型对每个号结果
+ * 完全相同（glm-4.7 → 11/11 号 400/11102；hunyuan-image-alpha →
+ * 5/5 号 400/11103），而 glm-5.3/hy3 同批全 200。所以它们是**模型**的属性、
+ * 不是账号的——这正是 `no_such_model` / `bad_request` 的判据：核心据此跳过
+ * 本供应商而**不给账号记账**。若归 unknown，就会逐号冷却、把整个池遍历一遍
+ * 才以 503 收场（现象：面板 30 个模型里 7 个点了就失败、且失败一次要等很久）。
+ */
+test('模型级拒绝：11102（已下架）归 no_such_model，11103（生图当聊天）归 bad_request', async () => {
+  assert.equal(cn.classifyGatewayCode?.(11102), 'no_such_model', '目录未摘但上游已下架')
+  assert.equal(en.classifyGatewayCode?.(11102), 'no_such_model')
+  assert.equal(cn.classifyGatewayCode?.(11103), 'bad_request', '生图模型走不了 chat 端点')
+  assert.equal(en.classifyGatewayCode?.(11103), 'bad_request')
+  // 端到端：核心读到的 state 必须是这两个，而不是 unknown
+  for (const [p, code, want] of [
+    [cn, 11102, 'no_such_model'],
+    [en, 11102, 'no_such_model'],
+    [cn, 11103, 'bad_request'],
+  ] as const) {
+    const { env, calls } = harness(p.id)
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/chat/completions')) {
+        calls.push({ url, init: init ?? {}, body: undefined })
+        return new Response(JSON.stringify({ code, msg: 'model level rejection' }), { status: 400 })
+      }
+      return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+    }) as typeof fetch
+    const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
+    assert.equal(r.ok === false ? r.state : '', want, `${p.id} code=${code}`)
+  }
+})
+
+/**
+ * **403 + 11140 属于账号级风控，不是请求级拒绝**（2026-10-10 实测订正）。
+ *
+ * 这条判据是踩出来的：11140 的响应体带 `displayMsg`，写着
+ * "The content did not pass the safety review."，看起来像内容审核（请求级）。
+ * 但实测不是——同一段无害内容、甚至**不带任何 user 消息（仅 system）**也一样
+ * 被拒，而同一时刻同样请求换本机另外两个号都能正常出字：
+ *
+ *   wb-1 system-only → 403/11140    wb-2 → 200    wb-3 → 200
+ *   wb-1 system+hi   → 403/11140    wb-2 → 200    wb-3 → 200
+ *   wb-1 不存在的模型 → 403/11140    wb-2 → 400/11102（模型级，正常报）
+ *
+ * 它描述的是「这个账号被风控」，所以必须是 session_dead（连接级冷却 30 分钟、
+ * 到期自愈、**逐号换**）。若误判成 bad_request，核心会**跳过整个供应商**，
+ * 那两个可用号就永远轮不到——一个错误分类直接变成可用性损失。
+ * 同理也**不能**按 HTTP 状态之外的顺序把它提前判成请求级。
+ */
+test('403 + 11140 是账号级风控：归 session_dead（可换号），绝不归 bad_request', async () => {
+  assert.equal(en.classifyGatewayCode?.(11140), undefined, '11140 不参与 code 归类（它是账号级，不是请求级）')
+  assert.equal(cn.classifyGatewayCode?.(11140), undefined)
+  for (const p of [cn, en] as const) {
+    const { env, calls } = harness(p.id)
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/chat/completions')) {
+        calls.push({ url, init: init ?? {}, body: undefined })
+        return new Response(
+          JSON.stringify({ code: 11140, msg: 'request illegal', displayMsg: { en: 'The content did not pass the safety review.' } }),
+          { status: 403 },
+        )
+      }
+      return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+    }) as typeof fetch
+    const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
+    assert.equal(r.ok === false ? r.state : '', 'session_dead', `${p.id}: 403/11140 必须可换号，否则丢掉健康号`)
+  }
+})
+
 test('429/401 的分类不受 profile 影响', async () => {
   for (const [p, status, want] of [
     [cn, 429, 'rate_limit'],

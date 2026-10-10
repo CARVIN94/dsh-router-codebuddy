@@ -70,9 +70,22 @@ export const profile: SupplierProfile = {
   // 11133（请求参数非法）/11135（图片无法识别）**不是账号的错**：同一个请求
   // 对每个号都一样失败，冷号 = 把一次「请求有问题」放大成「这个模型谁都别用」
   // （2026-09-15 读图 11148/11133 事故）。归 bad_request，核心不惩罚账号。
+  //
+  // 2026-10-10 实测追加两条（`/v3/config` 列着但实际调不动的模型）：
+  //  - 11102 `model [x] service info not found` —— 目录还没摘掉、上游已经下架。
+  //    实测本账号 30 个已发布模型里 7 个如此（glm-4.7/glm-4.6/glm-4.6v/glm-5.0/
+  //    minimax-m2.5/kimi-k2-thinking/hy4-preview-x）。归 no_such_model：核心
+  //    跳过整个供应商、**不记在账号头上**；若归 unknown 就会逐号冷却、遍历
+  //    全池后才以 503 收场 —— 与「模型不存在」的真实语义完全不符。
+  //    注意**不能**改用目录里的元数据提前筛掉它们：实测这 7 个与可用的 23 个
+  //    在 credits / supportsToolCall / vendor / supportsReasoning 上签名完全相同，
+  //    也无法用 agents[].models 交集（会误杀 6 个实测可用的模型）。
+  //  - 11103 `Backend [x] is not supported` —— 生图模型被当聊天模型调用。
   classifyGatewayCode: (code) => {
     if (code === 11134) return 'rate_limit'
     if (code === 11133 || code === 11135) return 'bad_request'
+    if (code === 11102) return 'no_such_model'
+    if (code === 11103) return 'bad_request'
     return undefined
   },
 }
