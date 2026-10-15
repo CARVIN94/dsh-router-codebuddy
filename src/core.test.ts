@@ -499,3 +499,49 @@ test('无 iat 的 token（解不出签发时间）：回落到按 expiresAt 判�
   const ref = calls.filter((c) => c.url.includes('/token/refresh'))
   assert.equal(ref.length, 0, '解不出 iat 且未临到期，不该刷新')
 })
+
+// ------------------------------------------------ 6004 频率限制的重置时刻
+
+/**
+ * 2026-10-15 事故：11 个 CN 号全部撞 6004「您的使用量已超出频率限制，将在
+ * … 重置」。上游**自己报了重置时刻**，但核心只做 5min 上限的指数退避 →
+ * 到点回来再撞，号轮流被打冷。这里锁住：rate_limit 且文案带重置时刻时，
+ * 必须把 epoch ms 交给核心（冷却语义在核心的 account-pool 测试里）。
+ */
+test('6004 频率限制：解析文案里的重置时刻（UTC+8/跨日），交给核心冷却', async () => {
+  for (const [msg, want] of [
+    ['您的使用量已超出频率限制，将在 2026-10-15 20:26:05 UTC+8 重置，您也可以切换其他模型继续使用。', Date.UTC(2026, 9, 15, 12, 26, 5)],
+    ['您的使用量已超出频率限制，将在 2026-10-16 13:11:45 UTC+8 重置。', Date.UTC(2026, 9, 16, 5, 11, 45)],
+  ] as const) {
+    const { env, calls } = harness(cn.id)
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init: init ?? {}, body: undefined })
+      return new Response(JSON.stringify({ code: 6004, msg }), { status: 429 })
+    }) as typeof fetch
+    const r = await createSupplier(cn)(env).chatOnce('u1', 'auto', req)
+    assert.equal(r.ok === false ? r.state : '', 'rate_limit')
+    assert.equal(r.ok === false ? r.resetAt : 0, want, msg)
+  }
+})
+
+test('6004 文案没有可解析的重置时刻：不带 resetAt（fail-open，核心照旧退避）', async () => {
+  const { env, calls } = harness(cn.id)
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), init: init ?? {}, body: undefined })
+    return new Response(JSON.stringify({ code: 6004, msg: '您的使用量已超出频率限制，请稍后再试。' }), { status: 429 })
+  }) as typeof fetch
+  const r = await createSupplier(cn)(env).chatOnce('u1', 'auto', req)
+  assert.equal(r.ok === false ? r.state : '', 'rate_limit')
+  assert.equal(r.ok === false ? r.resetAt : 0, undefined, '解析不出不该编造时刻')
+})
+
+test('非限流错误即使文案带时刻也不给 resetAt（冷却语义不串味）', async () => {
+  const { env, calls } = harness(cn.id)
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), init: init ?? {}, body: undefined })
+    return new Response(JSON.stringify({ code: 11133, msg: 'bad request，将在 2026-10-15 20:26:05 UTC+8 重置' }), { status: 400 })
+  }) as typeof fetch
+  const r = await createSupplier(cn)(env).chatOnce('u1', 'auto', req)
+  assert.equal(r.ok === false ? r.state : '', 'bad_request')
+  assert.equal(r.ok === false ? r.resetAt : 0, undefined)
+})

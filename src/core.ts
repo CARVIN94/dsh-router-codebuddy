@@ -163,6 +163,21 @@ function gatewayError(prefix: string, body: string, status: number): string {
   return `upstream ${status}: ${body.slice(0, 200)}`
 }
 
+/**
+ * 上游声明的重置时刻（epoch ms）——限流文案自带：「…将在 2026-10-15 20:26:05
+ * UTC+8 重置…」。解析出来交给核心冷到那个点；**解析不出就退回 undefined**，
+ * 核心照旧指数退避（fail-open：文案格式变了不该把请求打死）。
+ * 天花板：只认 `YYYY-MM-DD HH:mm:ss UTC±X` 这一种实测格式，英文版重置文案
+ * （WorkBuddy）遇到再补——未匹配时行为与改动前完全一致。
+ */
+function resetAtOf(body: string): number | undefined {
+  const m = /(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\s*UTC([+-]\d{1,2})/.exec(body)
+  if (!m) return undefined
+  const [, y, mo, d, h, mi, s, off] = m
+  // UTC+8 的墙钟 20:26:05 = UTC 12:26:05，故减去偏移小时数
+  return Date.UTC(+y!, +mo! - 1, +d!, +h!, +mi!, +s!) - +off! * 3_600_000
+}
+
 /** 剥本供应商 alias 前缀（只剥自己的，模型 id 自带的斜杠保留，否则自定义模型
  *  `org/name` 会被剥成 `name`，请求必然 404）。 */
 function stripAlias(model: string, alias: string): string {
@@ -692,7 +707,9 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
               : upstream.status === 401 || upstream.status === 403 ? 'session_dead'
                 : upstream.status === 404 ? 'unavailable'
                   : byCode ?? (extType === 'invalid_request_error' ? 'bad_request' : 'unknown')
-          return { ok: false, state, message: gwErr }
+          // 限流文案自带重置时刻（6004「将在 … 重置」）→ 交给核心冷到那个点
+          const resetAt = state === 'rate_limit' ? resetAtOf(text) : undefined
+          return { ok: false, state, message: gwErr, ...(resetAt === undefined ? {} : { resetAt }) }
         }
         // 上游恒为流式：原样交回核心写
         if (!upstream.body) {
