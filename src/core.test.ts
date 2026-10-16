@@ -8,7 +8,9 @@
  *   2. 国际侧三个网关归一化存在（developer→system、tool_choice 对象→string、
  *      首条非 system 前置兜底）且**顺序正确**（补 system 必须在改 role 之后）；
  *   3. 端点候选回退只在 404/405 触发；
- *   4. 两个 id / 存储键 / uid 前缀不变 —— 改它 = 已登录账号全部消失。
+ *   4. 两个 id / 存储键 / uid 前缀不变 —— 改它 = 已登录账号全部消失；
+ *   5. 国际侧出站净化剥 WAF 敏感词的命令替换外壳，词与其他反引号不动（issue #3）；
+ *   6. 403 按 body 形态二分：JSON → session_dead，非 JSON（WAF HTML）→ bad_request。
  *
  * 运行：npm test（node --test，靠 Node 内建 TS 类型剥离）。
  */
@@ -375,7 +377,69 @@ test('403 + 11140 是账号级风控：归 session_dead（可换号），绝不�
   }
 })
 
-test('429/401 的分类不受 profile 影响', async () => {
+/**
+ * **403 按 body 形态二分**（issue #3，2026-10-16）：
+ *
+ *   - JSON body（业务风控 11140 等）→ 账号级 → session_dead（可换号）；
+ *   - 非 JSON body（WAF Block Page HTML）→ 请求级 → bad_request（不冷号）。
+ *
+ * www.workbuddy.ai 前置 WAF 的「命令注入」规则把请求体里命令替换外壳包住的
+ * 敏感词当 shell 命令执行，命中即 403 + HTML。WAF 在鉴权前判定（假 token 与
+ * 真 token 结果一致），同一 body 对每个号都一样失败 —— 归 session_dead 会把
+ * 一次 WAF 误判放大成单号池 30 分钟全灭 503，这正是 issue #3 的放大器。
+ */
+test('403 按 body 形态二分：非 JSON（WAF HTML）→ bad_request 不冷号；JSON → session_dead', async () => {
+  for (const p of [cn, en] as const) {
+    for (const [body, contentType, want] of [
+      ['<!DOCTYPE html><html><head><title>WAF Block Page</title></head><body>blocked</body></html>', 'text/html', 'bad_request'],
+      [JSON.stringify({ code: 9999, msg: 'account risk' }), 'application/json', 'session_dead'],
+    ] as const) {
+      const { env, calls } = harness(p.id)
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('/chat/completions')) {
+          calls.push({ url, init: init ?? {}, body: undefined })
+          return new Response(body, { status: 403, headers: { 'Content-Type': contentType } })
+        }
+        return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+      }) as typeof fetch
+      const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
+      assert.equal(r.ok === false ? r.state : '', want, `${p.id}: 403 + ${contentType}`)
+    }
+  }
+})
+
+/**
+ * issue #3：WAF 命中的是「命令替换外壳 + 敏感词」。出站净化剥外壳留词，
+ * 语义无损（同一份 204KB body 去外壳后放行，实测）；非敏感词的反引号
+ * 不动 —— 用户 markdown / 代码示例不受损。
+ */
+test('国际侧出站净化：敏感词的命令替换外壳剥掉、词保留；其他反引号不动', async () => {
+  const { env, calls } = harness(en.id)
+  const m = createSupplier(en)(env)
+  const raw = JSON.stringify({
+    model: 'm',
+    messages: [
+      {
+        role: 'system',
+        content: 'two-step: `confirm`, `Confirm`, `confirm: true`, $(whoami), `whoami`; untouched: `run_code`, confirm',
+      },
+      { role: 'user', content: 'hi' },
+    ],
+  })
+  await m.chatOnce('u1', 'auto', { rawBody: raw, stream: false, model: 'm' })
+  const sent = String(calls[0]!.init.body)
+  assert.ok(!sent.includes('`confirm'), 'confirm 左侧外壳剥掉')
+  assert.ok(!sent.includes('confirm`'), 'confirm 右侧外壳剥掉')
+  assert.ok(!sent.includes('`Confirm'), '大小写变体同样命中 WAF，同样处理')
+  assert.ok(!sent.includes('`whoami'), 'whoami 左侧外壳剥掉')
+  assert.ok(!sent.includes('whoami`'), 'whoami 右侧外壳剥掉')
+  assert.ok(!sent.includes('$(whoami)'), '$() 外壳也剥掉（实测命中的另一形态）')
+  assert.ok(sent.includes('confirm: true'), '词与中间内容保留（语义无损）')
+  assert.ok(sent.includes('`run_code`'), '非敏感词的反引号不动')
+})
+
+test('429/401/403(JSON) 的分类不受 profile 影响', async () => {
   for (const [p, status, want] of [
     [cn, 429, 'rate_limit'],
     [en, 429, 'rate_limit'],

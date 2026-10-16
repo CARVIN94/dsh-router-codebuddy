@@ -416,8 +416,9 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           return { uid, ok: false, status: 'error', message: j.msg ?? `签到失败 code=${String(j.code)}` }
         }
         if (!resp.ok) {
-          // 401/403 = 凭证失效（非 JSON 网关拦截也算）。冷却/禁用是核心的活，
-          // 这里只报事实：核心下次请求时该号会按 session_dead 被禁用。
+          // 401/403 = 凭证失效。签到请求体固定 '{}'、无用户内容，不会触发 WAF
+          // 拦截（chatOnce 的 403 非 JSON 是请求级拦截，见下方分类）。冷却/禁用
+          // 是核心的活，这里只报事实：核心下次请求时该号会按 session_dead 被禁用。
           if (resp.status === 401 || resp.status === 403) {
             return { uid, ok: false, status: 'error', message: `凭证失效 ${resp.status}` }
           }
@@ -685,8 +686,10 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           // 所以这类报 `bad_request`（核心不惩罚账号，直接换下一个）。
           let gwCode: number | undefined
           let extType: string | undefined
+          let isJsonBody = false
           try {
             const j = JSON.parse(text) as { code?: number; extError?: { type?: unknown } }
+            isJsonBody = true
             gwCode = typeof j.code === 'number' ? j.code : undefined
             extType = typeof j.extError?.type === 'string' ? j.extError.type : undefined
           } catch {
@@ -701,12 +704,19 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           // 已实测的反例：11140 随 403 到达且**是账号级**的（同一 token 在同一
           // host 上能读 /v3/config，同请求换 wb-2/wb-3 就成功），故必须留在
           // session_dead 上按连接级冷却 + 换号，而不是 bad_request。
+          //
+          // 403 再按 body 形态二分（issue #3，2026-10-16）：业务风控（11140 等）
+          // 是 **JSON**，账号级 → session_dead；前置 WAF/网关拦截（WAF Block Page）
+          // 是 **HTML**，请求级 —— 同一 body 对每个号都一样 403（WAF 在鉴权前判
+          // 定，假 token 与真 token 结果一致），归 bad_request 不惩罚账号。
+          // 否则一次 WAF 误判 = 该号 session_dead 冷 30 分钟，单号池直接 503 全灭。
           const byCode = gwCode === undefined ? undefined : p.classifyGatewayCode?.(gwCode)
           const state: AccountState =
             upstream.status === 429 ? 'rate_limit'
-              : upstream.status === 401 || upstream.status === 403 ? 'session_dead'
-                : upstream.status === 404 ? 'unavailable'
-                  : byCode ?? (extType === 'invalid_request_error' ? 'bad_request' : 'unknown')
+              : upstream.status === 401 || (upstream.status === 403 && isJsonBody) ? 'session_dead'
+                : upstream.status === 403 ? 'bad_request'
+                  : upstream.status === 404 ? 'unavailable'
+                    : byCode ?? (extType === 'invalid_request_error' ? 'bad_request' : 'unknown')
           // 限流文案自带重置时刻（6004「将在 … 重置」）→ 交给核心冷到那个点
           const resetAt = state === 'rate_limit' ? resetAtOf(text) : undefined
           return { ok: false, state, message: gwErr, ...(resetAt === undefined ? {} : { resetAt }) }

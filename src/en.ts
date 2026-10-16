@@ -129,6 +129,26 @@ function normalizeToolChoice(obj: Record<string, unknown>): void {
 }
 
 /**
+ * 出站净化：剥掉 WAF「命令注入」规则敏感词的命令替换外壳，词本身保留
+ * （issue #3，2026-10-16 实测）。www.workbuddy.ai 前置 WAF 把请求体里
+ * 「命令替换外壳 + 敏感词」当 shell 命令执行，命中即 403 + WAF Block Page：
+ *
+ *   `confirm` / `Confirm` / `confirm: true` / `whoami` / $(whoami) → 403
+ *   裸词 confirm、`run_code` 等其他反引号内容 → 放行
+ *
+ * 去外壳后同一份 204KB body 直接被放行（实测）。替换只删外壳字符、保留
+ * 中间原文，序列化后的 JSON 结构不会被破坏；跨字段的反引号对至多丢一个
+ * 反引号字符。只认这两个词（实测关键词表），用户的 markdown / 代码示例
+ * 不受损 —— WAF 关键词表若扩充，core.ts 的 403 非 JSON → bad_request 兜底
+ * 保证一次误判不再放大成整段供应商 30 分钟不可用。
+ */
+function stripCommandSubstitution(body: string): string {
+  return body
+    .replace(/`(confirm|whoami)([^`]*)`/gi, '$1$2')
+    .replace(/\$\((confirm|whoami)([^)]*)\)/gi, '$1$2')
+}
+
+/**
  * 防网关 code 11128「first message is not system prompt」：首条消息不是 system 时，
  * 在 messages 最前补一条兜底 system。仅当首条确为 system 时不注入。
  * 参考 workbuddy2api ensureConsoleSystem（国际版 console 域上游要求首条为 system）。
@@ -191,6 +211,8 @@ export const profile: SupplierProfile = {
   // 也就是说它描述的是「这个账号被风控了」，不是「这条请求有问题」。
   // 归 bad_request 会让核心**跳过整个供应商、失去换号**，正好丢掉那两个可用号；
   // 留在默认的 403 → session_dead（连接级冷却 30 分钟、到期自愈、逐号换）才对。
+  // 该判据只适用于 403 + **JSON body**（业务风控带 code）；403 + 非 JSON（WAF
+  // Block Page HTML）是请求级拦截，core.ts 归 bad_request（issue #3）。
   classifyGatewayCode: (code) => {
     if (code === 11134) return 'rate_limit'
     if (code === 11128 || code === 11133 || code === 11135) return 'bad_request'
@@ -203,5 +225,6 @@ export const profile: SupplierProfile = {
     normalizeRoles(obj)
     normalizeToolChoice(obj)
   },
-  normalizeBodyText: ensureConsoleSystem,
+  // 串行两步：先补兜底 system（11128），再剥 WAF 敏感词的命令替换外壳（issue #3）
+  normalizeBodyText: (body) => stripCommandSubstitution(ensureConsoleSystem(body)),
 }
