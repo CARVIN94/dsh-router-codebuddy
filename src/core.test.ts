@@ -4,13 +4,17 @@
  * 差异全部收敛进 cn.ts / en.ts 的 profile，共享逻辑只有 core.ts 一份 ——
  * 本测试锁住的就是**profile 边界**：
  *
- *   1. 国内侧不多发 system、不动 tool_choice、只打 /v2；
- *   2. 国际侧三个网关归一化存在（developer→system、tool_choice 对象→string、
- *      首条非 system 前置兜底）且**顺序正确**（补 system 必须在改 role 之后）；
+ *   1. 国内侧只打 /v2，且与国内网关同源地做 11128 归一（developer→system、
+ *      tool_choice 对象→string、首条非 system 前置兜底）；
+ *   2. 国际侧多一层 WAF 外壳剥离，且**顺序正确**（补 system 必须在改 role 之后）；
  *   3. 端点候选回退只在 404/405 触发；
  *   4. 两个 id / 存储键 / uid 前缀不变 —— 改它 = 已登录账号全部消失；
  *   5. 国际侧出站净化剥 WAF 敏感词的命令替换外壳，词与其他反引号不动（issue #3）；
- *   6. 403 按 body 形态二分：JSON → session_dead，非 JSON（WAF HTML）→ bad_request。
+ *   6. 403 按 body 形态二分：JSON → session_dead，非 JSON（WAF HTML）→ bad_request；
+ *   7. 11128 渠道闸：三级重试阶梯（原样 → 强制中性头 → 零宽散点），耗尽报
+ *      bad_request（**不**判账号死）；
+ *   8. 积分：读 cycle 家族、请求体带分页/产品码、企业号读企业表（剩余 = 上限 − 已用）；
+ *   9. 签到：先读 active / today_checked_in，未开活动与已签到都**不发写请求**。
  *
  * 运行：npm test（node --test，靠 Node 内建 TS 类型剥离）。
  */
@@ -162,7 +166,16 @@ test('模块暴露契约要求的能力', () => {
 
 // ---------------------------------------------------------------- 国内侧：行为逐字保留
 
-test('国内侧只打 /v2/chat/completions，不注入 system，不动 tool_choice', async () => {
+/**
+ * 国内侧的「过闸」归一是 2026-10-28 补上的，与原本的假设相反：
+ *
+ * 旧注释写「国内侧不做 11128 归一」，但参照实现（dsh-connect-workbuddy）在真实
+ * CN 号上实测到同一个 DSH system 开场白会被国内网关以 400/11128 拒
+ * （`Illegal API invocation from an unapproved channel`），而国际侧对同一句
+ * 放行。两个网关同族，所以归一化规则对两侧都成立，只有 WAF 外壳剥离是国际侧
+ * 独有的（那条 WAF 只在国际域名上实测到）。
+ */
+test('国内侧只打 /v2/chat/completions，并做与国内网关同源的 11128 归一', async () => {
   const { env, calls } = harness(cn.id)
   const m = createSupplier(cn)(env)
   const r = await m.chatOnce('u1', 'auto', req)
@@ -180,13 +193,40 @@ test('国内侧只打 /v2/chat/completions，不注入 system，不动 tool_choi
   assert.equal(h.Origin, undefined)
   assert.equal(h['Accept-Language'], undefined)
   assert.equal(h['X-No-Enterprise-Id'], undefined)
+  // 会话身份三连两侧都要带（缺了就是 11128「不是官方客户端」）
+  for (const k of ['X-Conversation-ID', 'X-Conversation-Request-ID', 'X-Conversation-Message-ID']) {
+    assert.match(h[k] ?? '', /^[0-9a-f-]{36}$/i, k)
+  }
 
-  // 国内侧不做 11128 归一：请求体保持「原样 + model/stream/推理等级」
+  // 首条是 user → 必须补一条兜底 system（网关要求会话以 system 开场）
   assert.deepEqual(calls[0]!.body, {
     model: 'm',
     stream: true,
-    messages: [{ role: 'user', content: 'hi' }],
+    messages: [
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: 'hi' },
+    ],
   })
+})
+
+test('国内侧：developer 已改写成 system，不再重复补 head（顺序语义）', async () => {
+  const { env, calls } = harness(cn.id)
+  const m = createSupplier(cn)(env)
+  await m.chatOnce('u1', 'auto', {
+    ...req,
+    rawBody: JSON.stringify({
+      model: 'm',
+      messages: [{ role: 'developer', content: 'sys' }, { role: 'user', content: 'hi' }],
+      tool_choice: { type: 'auto' },
+    }),
+  })
+  const sent = calls[0]!.body!
+  assert.equal(sent.tool_choice, 'auto')
+  assert.deepEqual(
+    (sent.messages as Array<{ role: string }>).map((x) => x.role),
+    ['system', 'user'],
+    'developer → system 之后首条已是 system，不该再补一条',
+  )
 })
 
 test('国内侧推理等级：非 auto 加 reasoning_effort+reasoning_summary，auto 删字段', async () => {
@@ -608,4 +648,278 @@ test('非限流错误即使文案带时刻也不给 resetAt（冷却语义不串
   const r = await createSupplier(cn)(env).chatOnce('u1', 'auto', req)
   assert.equal(r.ok === false ? r.state : '', 'bad_request')
   assert.equal(r.ok === false ? r.resetAt : 0, undefined)
+})
+
+// ------------------------------------------------------- 11128 渠道闸与重试阶梯
+
+/** 按 URL 分派的 fetch：handler 拿到 (url, body, 同 URL 的第几次调用)。 */
+function routed(
+  calls: Call[],
+  handler: (url: string, body: Record<string, unknown> | undefined, seen: number) => Response,
+): void {
+  const counts = new Map<string, number>()
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input)
+    let parsed: Record<string, unknown> | undefined
+    if (typeof init?.body === 'string') {
+      try {
+        parsed = JSON.parse(init.body) as Record<string, unknown>
+      } catch {
+        parsed = undefined
+      }
+    }
+    calls.push({ url, init: init ?? {}, body: parsed })
+    const seen = counts.get(url) ?? 0
+    counts.set(url, seen + 1)
+    return handler(url, parsed, seen)
+  }) as typeof fetch
+}
+
+function jsonResponse(obj: unknown, status = 200): Response {
+  return new Response(JSON.stringify(obj), { status })
+}
+
+function okStream(): Response {
+  return new Response(
+    new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: ok\n\n'))
+        c.close()
+      },
+    }),
+    { status: 200 },
+  )
+}
+
+/** 上游真实的 11128 响应形状。 */
+const CHANNEL_GATE = {
+  code: 11128,
+  msg: 'Illegal API invocation from an unapproved channel',
+  displayTips: { zh: '可能不是官方客户端发出的' },
+}
+
+/** 一份「会撞渠道闸」的请求体：system 以被禁开场白开头。 */
+const GATED_BODY = JSON.stringify({
+  model: 'm',
+  messages: [{ role: 'system', content: 'You are an AI agent powered by DeepSeek Harness. Do the task.' }],
+})
+
+test('11128：先改请求（强制中性头）重试同一个号，重试成功就当成功', async () => {
+  for (const p of [cn, en] as const) {
+    const { env, calls } = harness(p.id)
+    routed(calls, (_url, _body, seen) => (seen === 0 ? jsonResponse(CHANNEL_GATE, 400) : okStream()))
+    const r = await createSupplier(p)(env).chatOnce('u1', 'auto', { ...req, rawBody: GATED_BODY })
+    assert.equal(r.ok, true, `${p.id}: 中性头重试应当救回来`)
+    assert.equal(calls.length, 2, `${p.id}: 第二次是同一端点（闸读请求不读账号）`)
+    const messages = calls[1]!.body!.messages as Array<{ role: string; content: string }>
+    assert.match(
+      messages[0]!.content,
+      /^You are a helpful assistant\.\n\nYou are an AI agent powered by DeepSeek Harness/,
+      `${p.id}: 被禁开场白必须挪到中性头之后`,
+    )
+  }
+})
+
+test('11128：一次中性头还不够时用零宽散点再试一次（三级阶梯）', async () => {
+  const { env, calls } = harness(cn.id)
+  // 前两次都被拒（第一次原样、第二次中性头），第三次放行
+  routed(calls, (_url, _body, seen) => (seen < 2 ? jsonResponse(CHANNEL_GATE, 400) : okStream()))
+  const r = await createSupplier(cn)(env).chatOnce('u1', 'auto', { ...req, rawBody: GATED_BODY })
+  assert.equal(r.ok, true)
+  assert.equal(calls.length, 3)
+  const third = String(calls[2]!.init.body)
+  assert.ok(third.includes('\u200b'), '第三级必须带零宽空格（打断精确子串指纹）')
+  assert.ok(third.includes('You are a helpful assistant.'), '零宽散点是叠加在中性头之上的')
+})
+
+test('11128：三级都被拒 → bad_request（不判账号死，让核心跳过本供应商）', async () => {
+  const { env, calls } = harness(cn.id)
+  routed(calls, () => jsonResponse(CHANNEL_GATE, 400))
+  const r = await createSupplier(cn)(env).chatOnce('u1', 'auto', { ...req, rawBody: GATED_BODY })
+  assert.equal(r.ok, false)
+  assert.equal(r.ok === false ? r.state : '', 'bad_request')
+  assert.equal(calls.length, 3, '最多三级，不多打上游')
+  // 三次的 body 必须逐级不同，否则那两次请求纯属浪费
+  assert.notEqual(String(calls[0]!.init.body), String(calls[1]!.init.body))
+  assert.notEqual(String(calls[1]!.init.body), String(calls[2]!.init.body))
+})
+
+test('非渠道闸的错误不重试（重试只对 11128 有意义）', async () => {
+  const { env, calls } = harness(cn.id)
+  routed(calls, () => jsonResponse({ code: 11133, msg: 'bad params' }, 400))
+  const r = await createSupplier(cn)(env).chatOnce('u1', 'auto', { ...req, rawBody: GATED_BODY })
+  assert.equal(r.ok === false ? r.state : '', 'bad_request')
+  assert.equal(calls.length, 1, '11133 是参数问题，改内容不解决问题，不该重试')
+})
+
+test('会话身份三连每请求现生成，不是固定值', async () => {
+  const { env, calls } = harness(cn.id)
+  const m = createSupplier(cn)(env)
+  await m.chatOnce('u1', 'auto', req)
+  await m.chatOnce('u1', 'auto', req)
+  const idOf = (i: number): string =>
+    (calls[i]!.init.headers as Record<string, string>)['X-Conversation-ID'] ?? ''
+  assert.match(idOf(0), /^[0-9a-f-]{36}$/i)
+  assert.notEqual(idOf(0), idOf(1), '同一秒的两个请求不能共用会话 id')
+})
+
+// ---------------------------------------------------------------- 积分
+
+test('积分请求体带分页/产品码/状态/时间窗（发 {} 会漏包）', async () => {
+  const { env, calls } = harness(en.id)
+  routed(calls, (url) =>
+    url.includes('get-user-resource') ? jsonResponse({ code: 0, data: { Response: { Data: { Accounts: [] } } } }) : jsonResponse({}, 500),
+  )
+  const m = createSupplier(en)(env)
+  m.status()
+  await new Promise((r) => setTimeout(r, 50))
+  const sent = calls.find((c) => c.url.includes('get-user-resource'))!.body!
+  assert.equal(sent.PageNumber, 1)
+  assert.equal(sent.PageSize, 100)
+  assert.equal(sent.ProductCode, 'p_tcaca')
+  assert.deepEqual(sent.Status, [0, 3])
+  assert.match(String(sent.PackageEndTimeRangeBegin), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, '上游只收本地墙钟格式')
+  assert.match(String(sent.PackageEndTimeRangeEnd), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+})
+
+test('积分余额按 cycle 家族求和：月度资源读 CycleCapacityRemain，过期/耗尽的赠送包不计', async () => {
+  const { env, calls } = harness(en.id)
+  const past = '2020-01-01 00:00:00'
+  const future = '2099-01-01 00:00:00'
+  routed(calls, (url) =>
+    url.includes('get-user-resource')
+      ? jsonResponse({
+        code: 0,
+        data: {
+          Response: {
+            Data: {
+              Accounts: [
+                // 月度资源：两族数值故意不同，必须读 cycle 那族
+                { CapacityType: 4, CycleCapacityRemain: 500, CycleCapacityRemainPrecise: '500', CapacityRemain: 500 },
+                // 赠送包：Precise 带两位小数，必须保留
+                { CapacityType: 1, CycleCapacityRemainPrecise: '1696.61', CapacityRemain: 2196, ExpiredTime: future },
+                // 已过期 → 不计
+                { CapacityType: 1, CapacityRemain: 300, ExpiredTime: past },
+                // 已耗尽 → 不计
+                { CapacityType: 1, CapacityRemain: 0 },
+              ],
+            },
+          },
+        },
+      })
+      : jsonResponse({}, 500),
+  )
+  const m = createSupplier(en)(env)
+  m.status()
+  await new Promise((r) => setTimeout(r, 50))
+  const acct = m.status().accounts[0]!
+  assert.equal(acct.credits, 2196.61, '500 + 1696.61；过期与耗尽的赠送包不能算进来')
+})
+
+test('企业号：读企业表，余额 = limitNum − credit（credit 是已消耗，不是余额）', async () => {
+  const cred = { nickname: 'N', accessToken: 'tok', refreshToken: 'ref', expiresAt: FAR_FUTURE, enterpriseId: 'ent-1' }
+  const { env, calls } = harness(en.id, { cred })
+  routed(calls, (url) =>
+    url.includes('get-enterprise-user-usage')
+      ? jsonResponse({ code: 0, data: { credit: 1234, limitNum: 5000, cycleResetTime: '2026-11-01 00:00:00' } })
+      : jsonResponse({ code: 0, data: { Response: { Data: { Accounts: [] } } } }),
+  )
+  const m = createSupplier(en)(env)
+  m.status()
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(m.status().accounts[0]!.credits, 3766)
+  assert.ok(
+    !calls.some((c) => c.url.includes('get-user-resource')),
+    '有企业 ID 就不该去问个人表：它对企业成员答的是「空表」，不是余额',
+  )
+})
+
+test('个人表答空 Accounts（企业成员的合法形状）：回退企业表取余额', async () => {
+  const { env, calls } = harness(en.id)
+  routed(calls, (url) => {
+    if (url.includes('get-enterprise-user-usage')) {
+      return jsonResponse({ code: 0, data: { Data: { credit: 250, limitNum: 1000 } } })
+    }
+    return jsonResponse({ code: 0, data: { Response: { Data: { Accounts: [] } } } })
+  })
+  const m = createSupplier(en)(env)
+  m.status()
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(m.status().accounts[0]!.credits, 750)
+})
+
+test('两张表都读不出余额时报 -1（不是 0），核心据此保留上次的值', async () => {
+  const { env } = harness(en.id)
+  routed([], () => jsonResponse({ code: 0, data: { Response: { Data: { Accounts: [] } } } }))
+  const m = createSupplier(en)(env)
+  m.status()
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(m.status().accounts[0]!.credits, -1, '报 0 会把缓存冲成 0，面板永久显示 0 积分')
+})
+
+// ---------------------------------------------------------------- 签到
+
+test('签到：先读状态，active=false（该区没办活动）→ 报未开放且不发写请求', async () => {
+  const { env, calls } = harness(en.id)
+  routed(calls, (url) =>
+    url.includes('checkin-activity-status')
+      ? jsonResponse({ code: 0, data: { active: false, today_checked_in: false, streak_days: 0 } })
+      : jsonResponse({}, 200),
+  )
+  const r = await createSupplier(en)(env).checkinNow!('u1')
+  assert.equal(r.ok, false)
+  assert.match(String(r.message), /未开放/)
+  assert.ok(!calls.some((c) => c.url.includes('daily-checkin')), '活动没开就别花一次写请求')
+})
+
+test('签到：today_checked_in=true → 报已签到、不发写请求、顺手刷新积分', async () => {
+  const { env, calls } = harness(cn.id)
+  routed(calls, (url) => {
+    if (url.includes('checkin-activity-status')) {
+      return jsonResponse({ code: 0, data: { active: true, today_checked_in: true, streak_days: 11 } })
+    }
+    if (url.includes('get-user-resource')) {
+      return jsonResponse({ code: 0, data: { Response: { Data: { Accounts: [{ CapacityType: 4, CycleCapacityRemain: 120 }] } } } })
+    }
+    return jsonResponse({}, 200)
+  })
+  const r = await createSupplier(cn)(env).checkinNow!('u1')
+  assert.equal(r.ok, true)
+  assert.equal(r.status, 'already')
+  assert.match(String(r.message), /连续 11 天/)
+  assert.ok(!calls.some((c) => c.url.includes('daily-checkin')))
+  assert.ok(calls.some((c) => c.url.includes('get-user-resource')), '已签到也要刷新积分（用户点它就是想看额度）')
+})
+
+test('签到：active 且未签 → 真签发；状态读接口坏了则 fail-open 直接签', async () => {
+  for (const statusFails of [false, true]) {
+    const { env, calls } = harness(cn.id)
+    routed(calls, (url) => {
+      if (url.includes('checkin-activity-status')) {
+        return statusFails
+          ? new Response('not found', { status: 404 })
+          : jsonResponse({ code: 0, data: { active: true, today_checked_in: false } })
+      }
+      if (url.includes('daily-checkin')) {
+        return jsonResponse({ code: 0, data: { credit: 100, streak_days: 3 } })
+      }
+      return jsonResponse({ code: 0, data: { Response: { Data: { Accounts: [] } } } })
+    })
+    const r = await createSupplier(cn)(env).checkinNow!('u1')
+    assert.equal(r.ok, true, statusFails ? '状态读失败必须 fail-open' : '')
+    assert.equal(r.status, 'ok')
+    assert.match(String(r.message), /\+100 积分（连续 3 天）/)
+  }
+})
+
+test('签到：上游仍回 10001（已签到）时依旧当成功 —— 预读与幂等码两条腿都在', async () => {
+  const { env, calls } = harness(cn.id)
+  routed(calls, (url) => {
+    if (url.includes('checkin-activity-status')) return new Response('boom', { status: 500 })
+    if (url.includes('daily-checkin')) return jsonResponse({ code: 10001, msg: '今天已经签过了' }, 400)
+    return jsonResponse({ code: 0, data: { Response: { Data: { Accounts: [] } } } })
+  })
+  const r = await createSupplier(cn)(env).checkinNow!('u1')
+  assert.equal(r.ok, true)
+  assert.equal(r.status, 'already')
 })

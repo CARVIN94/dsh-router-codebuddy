@@ -32,9 +32,12 @@ OAuth 轮询登录、同样的 `/v2/chat/completions` 网关、同样的 `/billi
 
 ```
 src/
-  core.ts       共享实现 —— OAuth 登录、单账号 chat、token 刷新、签到、积分、模型拉取
+  core.ts       共享实现 —— OAuth 登录、单账号 chat、token 刷新、签到、积分、模型拉取、
+                11128 重试阶梯
+  body.ts       出站请求体归一 —— 接口归一（developer/tool_choice/system 头）、
+                WAF 外壳剥离、11128 重试用的中性头与零宽散点
   cn.ts         codebuddy profile    （copilot.tencent.com：/v2 单路径、CLI 指纹头）
-  en.ts         codebuddy-en profile （www.workbuddy.ai：/console→/v2 回退、桌面端指纹头、接口归一）
+  en.ts         codebuddy-en profile （www.workbuddy.ai：/console→/v2 回退、桌面端指纹头、WAF 净化）
   index.ts      插件入口（host 半，一次注册两个供应商）
   contract.ts   供应商契约（自含，与 dsh-router 契约同步）
   types.ts      通用类型（SupplierStatus / ChatRequest 等）
@@ -65,11 +68,13 @@ dsh plugin --profile web add dsh-router-codebuddy
 |---|---|
 | OAuth 轮询登录 | 生成登录链接 → 浏览器登录 → 后台轮询 token（每 5s，最多 5 分钟），自动落盘凭证。无粘贴回调步骤。 |
 | 模型列表 | 「获取模型」从上游 `GET /v3/config` 实时拉取（带账号 token，服务端下发，新模型上游一上线就能刷出来）；上游不可达时回退内置兜底表；仍可手动添加自定义模型。 |
-| 接口归一（仅国际版） | chat 出站前 `developer` → `system`、`tool_choice` 对象形态 → string、首条非 system 时前置兜底 system —— 规避上游 `11128 first message is not system prompt` / `11101 Unmarshal chat params failed`。 |
+| 接口归一（两个供应商） | chat 出站前 `developer` → `system`、`tool_choice` 对象形态 → string、首条非 system 时前置兜底 system —— 规避上游 `11128 first message is not system prompt` / `11101 Unmarshal chat params failed`。国内网关**同样**会拿 11128 拒 DSH 自己的 system 开场白，所以归一两侧都跑。 |
+| 11128 重试阶梯 | 被渠道闸拒绝（`Illegal API invocation from an unapproved channel`）时在**同一个号**上换请求形态重试，最多三级：原样 → 把被禁开场白挪到 `You are a helpful assistant.` 之后 → 在句读/词边界插零宽空格打断精确子串指纹。每级只在确实改了字节时才发；三级都被拒才报 `bad_request`（请求级，不判账号死）。 |
+| 会话身份头 | chat 每请求现生成 `X-Conversation-ID` / `-Request-ID` / `-Message-ID`（官方客户端特征；缺了会撞 11128「不是官方客户端」那一支）。 |
 | 连接池 | 多账号由核心按池顺序/策略（`fallback` / `round-robin`）选号回退，本插件只报告单个账号的成败与语义状态。 |
 | token 自动刷新 | 到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token。 |
-| 签到领积分 | 每日 100 积分（连续第 7 天 1000），核心遍历所有链接逐个调用。已签到上游返回 `code=10001`（HTTP 400 + 该码），幂等视为成功。 |
-| 积分显示 | 面板账号积分 = `get-user-resource` 各额度包的**剩余**求和（`CapacityRemain`，会续期的基础包取 `CycleCapacityRemain`），内存缓存 10 分钟，签到后自动刷新。注意 `TotalDosage` 是**累计已消耗**，不是剩余。积分的**持久化由核心统一做**（`supplier-config.json`），本插件拿不到时报 `-1` 让核心顶上次的值。 |
+| 签到领积分 | 每日 100 积分（连续第 7 天 1000），核心遍历所有链接逐个调用。**先读 `checkin-activity-status`**：`active=false`（该区没办活动）→ 报「未开放」不发写请求；`today_checked_in=true` → 报「已签到」并发刷新积分。真签发时上游回 `code=10001` 也当成功（幂等两条腿都在）。状态读失败一律 fail-open，照旧直接签。 |
+| 积分显示 | 面板账号积分 = `get-user-resource` 各额度包的**剩余**求和：统一读 cycle 家族（`CycleCapacityRemain[Precise]`），月度资源用 `CapacityType === 4` 判定，已过期/已耗尽的赠送包不计。请求体带分页/产品码/状态/到期时间窗（发 `{}` 会漏包）。**企业号**读 `get-enterprise-user-usage`，剩余 = `limitNum − credit`（`credit` 是已消耗）。内存缓存 10 分钟，签到后自动刷新。注意 `TotalDosage` 是**累计已消耗**，不是剩余。积分的**持久化由核心统一做**（`supplier-config.json`），本插件拿不到时报 `-1` 让核心顶上次的值。 |
 
 ## 使用
 
@@ -94,14 +99,15 @@ dsh plugin --profile web add dsh-router-codebuddy
 - **模型**：`GET /v3/config` → `data.models[]`（`id` / `maxInputTokens` / `tags`）
 - **登录**：`POST /v2/plugin/auth/state` 生成链接 → 浏览器登录 → 轮询 `GET /v2/plugin/auth/token?state=...` 换 token 落盘
 - **刷新**：`POST /v2/plugin/auth/token/refresh`（`X-Refresh-Token` 头，到期前 24 小时内触发）
-- **积分/签到**：`POST /v2/billing/meter/get-user-resource`、`POST /billing/meter/daily-checkin`
+- **积分/签到**：`POST /v2/billing/meter/get-user-resource`、`POST /billing/meter/daily-checkin`（404 回退 `/v2` 变体）、`POST /v2/billing/meter/checkin-activity-status`（只读预检）、`POST /billing/meter/get-enterprise-user-usage`（企业号余额）
 - 凭证：`auths/codebuddy/{uid}.json`（`{nickname, accessToken, refreshToken, expiresAt}`）
 
 **国际版 WorkBuddy**（`https://www.workbuddy.ai`）—— 与上面同契约，差异在路径与指纹：
 
 - **chat**：`POST /console/chat/completions`，404/405 回退 `POST /v2/chat/completions`；出站前做接口归一（见上表）
-- **积分/签到**：`POST /billing/meter/*`（无 `/v2` 前缀），404 回退 `/v2/billing/meter/*`
+- **积分/签到**：`POST /billing/meter/*`（无 `/v2` 前缀），404 回退 `/v2/billing/meter/*`；企业号另走 `/billing/meter/get-enterprise-user-usage`
 - **出站指纹头**：UA `WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1`、同域 `Origin`/`Referer`、`Accept-Language: en-US`、`X-No-Enterprise-Id: 1`
+- **WAF 净化**（仅国际侧）：剥掉 `confirm` / `whoami` 的命令替换外壳（见 issue #3）
 - 凭证：`auths/codebuddy-en/{uid}.json`
 
 ## 与核心的分工

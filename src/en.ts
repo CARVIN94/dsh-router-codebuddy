@@ -3,7 +3,8 @@
  *
  * 腾讯国际版 AI 办公工作台 WorkBuddy，与国内 copilot.tencent.com **同族同契约**
  * （OAuth 轮询登录 + OpenAI 兼容流式 chat + billing/meter 积分签到），差异只有
- * base/路径候选/指纹头/兜底模型，全部落在下面这份 profile 里；共享逻辑在 core.ts。
+ * base/路径候选/指纹头/兜底模型，全部落在下面这份 profile 里；共享逻辑在 core.ts，
+ * 出站归一的通用规则在 body.ts。
  * 参考 Sliverkiss/workbuddy2api。
  *
  * ⚠️ `id = 'codebuddy-en'` **同时是凭证与配置的存储键**（auths/{id}、
@@ -12,6 +13,7 @@
 import type { ModelInfo } from './types.ts'
 import type { SupplierProfile } from './core.ts'
 import { CODEBUDDY_ICON } from './icon.ts'
+import { ensureSystemHead, normalizeRoles, normalizeToolChoice, stripCommandSubstitution } from './body.ts'
 
 const BASE = 'https://www.workbuddy.ai'
 
@@ -58,122 +60,6 @@ function headers(token?: string, extra: Record<string, string> = {}): Record<str
   return h
 }
 
-/**
- * 把 messages 里的 `developer` 角色归一为 `system`（防网关 code 11128）。
- *
- * 上游对 role 字段做白名单校验，`developer` 不在白名单内，命中即 HTTP 400
- * code=11128（workbuddy2api payload.go normalizeRoles）。`developer` 是 OpenAI 新规范
- * 里 system 的别名（Codex / Cursor 等新客户端用它承载 system 级指令），改写为
- * system 不丢语义。只认 developer 一个值，其余角色原样保留。
- */
-function normalizeRoles(obj: Record<string, unknown>): void {
-  const msgs = obj.messages
-  if (!Array.isArray(msgs)) return
-  for (const m of msgs) {
-    if (m === null || typeof m !== 'object') continue
-    const msg = m as Record<string, unknown>
-    if (typeof msg.role === 'string' && msg.role.trim().toLowerCase() === 'developer') {
-      msg.role = 'system'
-    }
-  }
-}
-
-/**
- * 归一 tool_choice 为上游 Go struct 的 string 形态（防网关 code 11101）。
- *
- * 上游 tool_choice 字段是 string 类型，对象形态（`{"type":"auto"}` / `{"type":"function",
- * "function":{...}}`）命中即 HTTP 400 code=11101「Unmarshal chat params failed」
- * （实测 + workbuddy2api payload.go normalizeToolChoice）。OpenAI 新客户端（Codex 等）
- * 惯用对象形态。语义照搬参考实现：
- *   - "none" / {"type":"none"}       → 删 tool_choice + 删 tools/functions（上游无 none）
- *   - {"type":"auto"/"required"}     → 字符串 "auto"/"required"
- *   - {"type":"function","function":{"name":"x"}} → 字符串 "x"
- *   - 其他对象/非标量                 → 删 tool_choice（默认 auto 行为）
- */
-function normalizeToolChoice(obj: Record<string, unknown>): void {
-  const suppress = (): void => {
-    delete obj.tools
-    delete obj.functions
-  }
-  const tc = obj.tool_choice
-  if (tc === undefined) return
-  if (typeof tc === 'string') {
-    if (tc.trim().toLowerCase() === 'none') {
-      delete obj.tool_choice
-      suppress()
-    }
-    return
-  }
-  if (tc !== null && typeof tc === 'object') {
-    const v = tc as Record<string, unknown>
-    const typ = typeof v.type === 'string' ? v.type.trim().toLowerCase() : ''
-    if (typ === 'none') {
-      delete obj.tool_choice
-      suppress()
-    } else if (typ === 'auto' || typ === 'required') {
-      obj.tool_choice = typ
-    } else if (typ === 'function') {
-      const fn = v.function
-      let name = ''
-      if (fn !== null && typeof fn === 'object') name = String((fn as Record<string, unknown>).name ?? '')
-      if (name === '') name = String(v.name ?? '')
-      name = name.trim()
-      if (name !== '') obj.tool_choice = name
-      else obj.tool_choice = 'auto'
-    } else {
-      delete obj.tool_choice
-    }
-    return
-  }
-  delete obj.tool_choice
-}
-
-/**
- * 出站净化：剥掉 WAF「命令注入」规则敏感词的命令替换外壳，词本身保留
- * （issue #3，2026-10-16 实测）。www.workbuddy.ai 前置 WAF 把请求体里
- * 「命令替换外壳 + 敏感词」当 shell 命令执行，命中即 403 + WAF Block Page：
- *
- *   `confirm` / `Confirm` / `confirm: true` / `whoami` / $(whoami) → 403
- *   裸词 confirm、`run_code` 等其他反引号内容 → 放行
- *
- * 去外壳后同一份 204KB body 直接被放行（实测）。替换只删外壳字符、保留
- * 中间原文，序列化后的 JSON 结构不会被破坏；跨字段的反引号对至多丢一个
- * 反引号字符。只认这两个词（实测关键词表），用户的 markdown / 代码示例
- * 不受损 —— WAF 关键词表若扩充，core.ts 的 403 非 JSON → bad_request 兜底
- * 保证一次误判不再放大成整段供应商 30 分钟不可用。
- */
-function stripCommandSubstitution(body: string): string {
-  return body
-    .replace(/`(confirm|whoami)([^`]*)`/gi, '$1$2')
-    .replace(/\$\((confirm|whoami)([^)]*)\)/gi, '$1$2')
-}
-
-/**
- * 防网关 code 11128「first message is not system prompt」：首条消息不是 system 时，
- * 在 messages 最前补一条兜底 system。仅当首条确为 system 时不注入。
- * 参考 workbuddy2api ensureConsoleSystem（国际版 console 域上游要求首条为 system）。
- * body 不可解析时原样返回。
- */
-function ensureConsoleSystem(body: string): string {
-  try {
-    const obj = JSON.parse(body) as Record<string, unknown>
-    const msgs = obj.messages
-    if (!Array.isArray(msgs) || msgs.length === 0) return body
-    const first = msgs[0]
-    if (first !== null && typeof first === 'object') {
-      const role = (first as Record<string, unknown>).role
-      if (typeof role === 'string' && role.trim().toLowerCase() === 'system') return body
-    }
-    obj.messages = [
-      { role: 'system', content: 'You are a helpful assistant.' },
-      ...msgs,
-    ]
-    return JSON.stringify(obj)
-  } catch {
-    return body
-  }
-}
-
 export const profile: SupplierProfile = {
   id: 'codebuddy-en',
   name: 'CodeBuddyEN',
@@ -187,7 +73,17 @@ export const profile: SupplierProfile = {
   refreshUrl: `${BASE}/v2/plugin/auth/token/refresh`,
   // global 国际版 billing 路径无 /v2 前缀（workbuddy2api R9），404 回退 /v2 变体。
   usageUrls: [`${BASE}/billing/meter/get-user-resource`, `${BASE}/v2/billing/meter/get-user-resource`],
+  // 企业号余额在另一张表（同样是先无 /v2）；个人表对企业成员答空 Accounts 而非报错。
+  enterpriseUsageUrls: [
+    `${BASE}/billing/meter/get-enterprise-user-usage`,
+    `${BASE}/v2/billing/meter/get-enterprise-user-usage`,
+  ],
   checkinUrls: [`${BASE}/billing/meter/daily-checkin`, `${BASE}/v2/billing/meter/daily-checkin`],
+  // 签到状态读端点（ref 实测国际侧是 /v2 前缀一族）：404 才回退无前缀变体。
+  checkinStatusUrls: [
+    `${BASE}/v2/billing/meter/checkin-activity-status`,
+    `${BASE}/billing/meter/checkin-activity-status`,
+  ],
   domain: 'www.workbuddy.ai',
   headers,
   errPrefix: 'workbuddy',
@@ -198,9 +94,10 @@ export const profile: SupplierProfile = {
   // 11134（上游临时不可用）是瞬时故障 → 短冷换号。
   // 11128（首条不是 system）/11133（参数非法）/11135（图片认不出）都是**请求
   // 形态**问题，与账号无关——同一个请求对每个号结果相同，冷号无济于事。
-  // 11128 我们已经通过 normalizeRoles + ensureConsoleSystem 在出站前规避；
-  // 若仍出现，说明是这条请求的形态问题，报 bad_request 让核心换下一个，
-  // 而不是把好号冷 30 秒（2026-09-15 读图事故的同型放大）。
+  // 11128 我们已经通过 normalizeRoles + ensureSystemHead 在出站前规避；
+  // 若仍出现，core.ts 会先走一次 11128 重试阶梯（强制中性头 → 零宽散点），
+  // 阶梯也失败才报 bad_request 让核心换下一个，而不是把好号冷 30 秒
+  // （2026-09-15 读图事故的同型放大）。
   //
   // 11102/11103 与国内侧同义（模型已下架 / 生图模型当聊天用）。
   //
@@ -214,8 +111,9 @@ export const profile: SupplierProfile = {
   // 该判据只适用于 403 + **JSON body**（业务风控带 code）；403 + 非 JSON（WAF
   // Block Page HTML）是请求级拦截，core.ts 归 bad_request（issue #3）。
   classifyGatewayCode: (code) => {
+    if (code === 11128) return 'bad_request'
     if (code === 11134) return 'rate_limit'
-    if (code === 11128 || code === 11133 || code === 11135) return 'bad_request'
+    if (code === 11133 || code === 11135) return 'bad_request'
     if (code === 11102) return 'no_such_model'
     if (code === 11103) return 'bad_request'
     return undefined
@@ -226,5 +124,13 @@ export const profile: SupplierProfile = {
     normalizeToolChoice(obj)
   },
   // 串行两步：先补兜底 system（11128），再剥 WAF 敏感词的命令替换外壳（issue #3）
-  normalizeBodyText: (body) => stripCommandSubstitution(ensureConsoleSystem(body)),
+  normalizeBodyText: (body) => {
+    try {
+      const obj = JSON.parse(body) as Record<string, unknown>
+      ensureSystemHead(obj)
+      return stripCommandSubstitution(JSON.stringify(obj))
+    } catch {
+      return stripCommandSubstitution(body)
+    }
+  },
 }

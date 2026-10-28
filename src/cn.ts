@@ -10,6 +10,7 @@
 import type { ModelInfo } from './types.ts'
 import type { SupplierProfile } from './core.ts'
 import { CODEBUDDY_ICON } from './icon.ts'
+import { ensureSystemHead, normalizeRoles, normalizeToolChoice } from './body.ts'
 
 const BASE = 'https://copilot.tencent.com'
 
@@ -59,7 +60,18 @@ export const profile: SupplierProfile = {
   tokenUrl: `${BASE}/v2/plugin/auth/token`,
   refreshUrl: `${BASE}/v2/plugin/auth/token/refresh`,
   usageUrls: [`${BASE}/v2/billing/meter/get-user-resource`],
-  checkinUrls: [`${BASE}/billing/meter/daily-checkin`],
+  // 企业号余额在另一张表（无 /v2 前缀，探 /v2 答 404）；个人表对企业成员会答
+  // 200 + 空 Accounts，读它等于把「有额度」显示成 0。
+  enterpriseUsageUrls: [
+    `${BASE}/billing/meter/get-enterprise-user-usage`,
+    `${BASE}/v2/billing/meter/get-enterprise-user-usage`,
+  ],
+  // 首选路径沿用实测可用的无 /v2 形态，/v2 变体只兜 404。
+  checkinUrls: [`${BASE}/billing/meter/daily-checkin`, `${BASE}/v2/billing/meter/daily-checkin`],
+  checkinStatusUrls: [
+    `${BASE}/v2/billing/meter/checkin-activity-status`,
+    `${BASE}/billing/meter/checkin-activity-status`,
+  ],
   domain: 'copilot.tencent.com',
   headers,
   errPrefix: 'codebuddy',
@@ -81,11 +93,34 @@ export const profile: SupplierProfile = {
   //    在 credits / supportsToolCall / vendor / supportsReasoning 上签名完全相同，
   //    也无法用 agents[].models 交集（会误杀 6 个实测可用的模型）。
   //  - 11103 `Backend [x] is not supported` —— 生图模型被当聊天模型调用。
+  //
+  // 2026-10-28 追加 11128：国内网关**同样**拿 11128 拒 DSH 自己的 system 开场白
+  // （`You are an AI agent powered by DeepSeek Harness`：CN 400/11128，国际侧
+  // 对同一句放行）。这是**请求形态**问题（同一 body 换号结果相同），故归
+  // bad_request；出站侧已由 normalizeBody/normalizeBodyText 提前规避，真出现
+  // 说明撞上了没枚举过的开场白，core.ts 会先走一次重试阶梯再报。
   classifyGatewayCode: (code) => {
+    if (code === 11128) return 'bad_request'
     if (code === 11134) return 'rate_limit'
     if (code === 11133 || code === 11135) return 'bad_request'
     if (code === 11102) return 'no_such_model'
     if (code === 11103) return 'bad_request'
     return undefined
+  },
+  normalizeBody: (obj) => {
+    // 防网关 11128/11101：developer 角色归一为 system；tool_choice 对象形态归一为 string。
+    normalizeRoles(obj)
+    normalizeToolChoice(obj)
+  },
+  // 首条不是 system 时补兜底 system（11128）。国内侧不剥 WAF 外壳：那条 WAF
+  // 只在国际域名上实测到，无证据的字节改动不做。
+  normalizeBodyText: (body) => {
+    try {
+      const obj = JSON.parse(body) as Record<string, unknown>
+      ensureSystemHead(obj)
+      return JSON.stringify(obj)
+    } catch {
+      return body
+    }
   },
 }
