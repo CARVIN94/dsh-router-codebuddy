@@ -97,8 +97,9 @@ export const profile: SupplierProfile = {
   // 2026-10-28 追加 11128：国内网关**同样**拿 11128 拒 DSH 自己的 system 开场白
   // （`You are an AI agent powered by DeepSeek Harness`：CN 400/11128，国际侧
   // 对同一句放行）。这是**请求形态**问题（同一 body 换号结果相同），故归
-  // bad_request；出站侧已由 normalizeBody/normalizeBodyText 提前规避，真出现
-  // 说明撞上了没枚举过的开场白，core.ts 会先走一次重试阶梯再报。
+  // bad_request；出站侧已由 normalizeBody/normalizeBodyText + 内容指纹按句改写
+  // 提前规避（后者是 2026-10-29 的主修复：CN 网关匹配前规范化零宽字符，只有真
+  // 改词才 200），真出现说明撞上了没枚举过的句子，core.ts 会先走一次重试阶梯再报。
   classifyGatewayCode: (code) => {
     if (code === 11128) return 'bad_request'
     if (code === 11134) return 'rate_limit'

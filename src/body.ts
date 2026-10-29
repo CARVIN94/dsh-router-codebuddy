@@ -8,9 +8,12 @@
  * 分工：
  *   - `normalizeRoles` / `normalizeToolChoice` / `ensureSystemHead`：**出站前**
  *     无条件跑，成本为零（不命中不改字节），拦的是确定性的形态校验。
+ *   - `rewriteChannelFingerprints`：**也出站前无条件跑**，但它是「命中才动」的
+ *     内容改写 —— 只有实测被拒的那几句会被换词，其余请求逐字节不变。2026-10-29
+ *     起它是 11128 的主修复（零宽扰动会被网关规范化掉，见 CHANNEL_GATE_PHRASES）。
  *   - `forceNeutralHead` / `perturbChannelFingerprints`：**只在 11128 之后**由
- *     core.ts 的重试阶梯调用。它们改的是内容，代价是「这条请求不再是原样」，
- *     所以不许预防式地每请求跑（2026-10-28 决定：不做每请求预防）。
+ *     core.ts 的重试阶梯调用 —— 它们对**任何**被扫描文本都动手，代价是整条请求
+ *     不再是原样，所以不许预防式地每请求跑（2026-10-28 决定）。
  */
 
 /** 首条消息不是 system 时补的兜底 system（也是 11128 中性头）。 */
@@ -149,6 +152,11 @@ export function stripCommandSubstitution(body: string): string {
  * 且大小写不敏感。**所以修复不需要知道被禁的是哪一句** —— 把它从第 0 个字符
  * 挪开就行。
  *
+ * **2026-10-29 修正：这条只对「开场白」成立。** 同一张清单里另有一族按
+ * **任意位置**匹配（`@` 路径段 8 句、Web GUI 段），挪位无效；而且网关匹配前会
+ * **规范化不可见字符**，零宽散点也无效。那一族的解法是出站前一层的按句改写
+ * （见 {@link CHANNEL_GATE_PHRASES}），下面的阶梯对它们只是兜底。
+ *
  * 这张表只是「实测到过的样本」，**不能**当成判据：清单在上游手里，会随时变长。
  * 因此重试阶梯不按表匹配（见 {@link forceNeutralHead}），表留在这里是因为它
  * 记录了「为什么加一行前缀就能过」这条结论的来源。
@@ -232,16 +240,123 @@ export function forceNeutralHead(bodyJson: string): string | undefined {
   return changed ? JSON.stringify(obj) : undefined
 }
 
+// --------------------------------------------- 内容指纹：按句改写（出站前跑）
+
 /**
- * 身份子句：网关除了「开头」还按**精确子串**匹配这三句 DSH 自己的开场白。
+ * 网关的内容指纹表 + 同义改写（2026-10-29 实测，对齐 dsh-connect-workbuddy 5.13.1）。
  *
- * 前缀规则（{@link UNAPPROVED_OPENINGS}）拦不住它 —— 短串在中间原样保留，
- * 加一行前缀只是把它往下挪了一行。实测三处全改才 200（只改一两处仍 400）。
- * 第 2 句里的模型名不稳定（`qmodel_38max` / `deepseek-v4.1-flash` …），
- * 所以匹配到 `powered by` 就停，尾巴交给下面的散点规则。
+ * **为什么不是零宽散点。** CN 网关在匹配前会**规范化掉不可见字符**：在本机真实
+ * DSH system 上，`root\u200b` / `works\u200bpace` 这类插法仍然 400/11128。
+ * 也就是说 {@link perturbChannelFingerprints} 对这一族**注定无效**（它是给
+ * 「精确子串、不做规范化」的老规则准备的）。真改词才 200 —— 实测同一份 system
+ * 只把这下面几行换掉就 2/2 全过。
+ *
+ * **为什么按句而不是整段。** `@` 路径那 8 句是**组合**指纹：逐句单发都 200，
+ * 整段一起发才 400。整段当一个字面量替换，宿主改一个词就失配；逐句改写既拆掉
+ * 组合，又只依赖单句。同理实测最小触发跨度只有 **112 字**（该段前两句），所以
+ * 行必须细到句子。
+ *
+ * `from` 按**任意位置**匹配（实测规则与位置无关），命中才替换，其余字节一个不
+ * 动 —— 上游本来就 200 的请求逐字节不变。
+ *
+ * 表会长：哪行开始不命中，就去对应宿主包看新措辞（identity 在
+ * `@deepseek-ai/dsh-system-prompt`、`@` 路径段在 `@deepseek-ai/dsh-file-reference`、
+ * Web GUI 段在 `@deepseek-ai/dsh-harness-dev-context`）。
  */
-const IDENTITY_CLAUSE =
-  /(you)(\s+are\s+(?:(?:an?\s+)?[\w-]*\s*agent\s+powered\s+by|interacting\s+with\s+the\s+user\s+through\s+the\s+deepseek\s+harness))/giu
+const CHANNEL_GATE_PHRASES: readonly (readonly [string, string])[] = [
+  [
+    'You are an AI agent powered by DeepSeek Harness',
+    'You are an AI agent running inside DeepSeek Harness',
+  ],
+  [
+    'You are a coding agent powered by the ',
+    'You are a coding agent running on the ',
+  ],
+  [
+    'You are interacting with the user through the DeepSeek Harness Web GUI',
+    'You are working with the user inside the DeepSeek Harness Web GUI',
+  ],
+  [
+    'Agent Teams is available in this session',
+    'Agent Teams is enabled for this session',
+  ],
+  // `@` 路径段，逐句（含分号/冒号分句）。
+  [
+    'Tokens prefixed with @ are paths the user explicitly referenced.',
+    'Paths that begin with @ are the ones the user explicitly referenced.',
+  ],
+  [
+    // 不带分号匹配：实测**截断形态**（该段只发到第二句、宿主在 112 字处就断）
+    // 结尾没有 `;`，按带分号的字面量就失配 —— 而那一形态同样 400/11128。
+    // 子串匹配覆盖带分号的完整句子，一份行管两种形态。
+    'Relative paths resolve from the workspace root',
+    'Relative paths are resolved against the workspace root',
+  ],
+  [
+    'absolute paths identify files or directories on the host.',
+    'absolute paths point at files or directories on the host.',
+  ],
+  [
+    'A trailing slash marks a directory:',
+    'A trailing slash indicates a directory:',
+  ],
+  [
+    'list it when its contents matter.',
+    'list it whenever its contents matter.',
+  ],
+  [
+    'Anything else is a file:',
+    'Everything else is a file:',
+  ],
+  [
+    'use the read tool when its contents are needed,',
+    'use the read tool whenever you need its contents,',
+  ],
+  [
+    'and do not claim to have inspected it before reading.',
+    'and never claim to have inspected it before reading it.',
+  ],
+  [
+    '@"..." quotes a path containing spaces.',
+    'A path containing spaces is quoted with @"...".',
+  ],
+]
+
+/**
+ * 改写一段文本里的内容指纹。
+ *
+ * 幂等：每个 `to` 都与自己的 `from` 不同、也不制造别的 `from`，第二遍是空操作。
+ */
+export function rewriteChannelFingerprintPhrases(text: string): string {
+  let out = text
+  for (const [from, to] of CHANNEL_GATE_PHRASES) {
+    if (out.includes(from)) out = out.replaceAll(from, to)
+  }
+  return out
+}
+
+/**
+ * 对整份请求体做内容指纹改写（只碰 system / assistant，与闸扫描的角色一致）。
+ *
+ * 没命中任何一行就返回**入参原文**（不是重新序列化的结果）：上游本来就 200 的
+ * 请求必须逐字节不变，这是 body.ts 的总规矩。
+ */
+export function rewriteChannelFingerprints(bodyJson: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(bodyJson)
+  } catch {
+    return bodyJson
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return bodyJson
+  const obj = parsed as Record<string, unknown>
+  const changed = forEachScannedText(obj, (get, set) => {
+    const text = get()
+    const next = rewriteChannelFingerprintPhrases(text)
+    if (next !== text) set(next)
+  })
+  return changed ? JSON.stringify(obj) : bodyJson
+}
 
 /** 两个相邻首字母大写的词之间（`DeepSeek|Harness`）：产品名也得断开。 */
 const WORD_INTERNAL_BREAK = /([A-Z][A-Za-z0-9]*)(\s+)(?=[A-Z][A-Za-z0-9])/gu

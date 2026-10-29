@@ -19,7 +19,12 @@
  */
 import type { ChatRequest, ModelInfo } from './types.ts'
 import type { AccountState, ChatOnceResult, SupplierEnv, SupplierModule, SupplierStatusNow } from './contract.ts'
-import { forceNeutralHead, isChannelRejectBody, perturbChannelFingerprints } from './body.ts'
+import {
+  forceNeutralHead,
+  isChannelRejectBody,
+  perturbChannelFingerprints,
+  rewriteChannelFingerprints,
+} from './body.ts'
 
 /**
  * 一个上游网关的差异描述 —— codebuddy 族两个供应商的全部不同都在这里。
@@ -153,8 +158,8 @@ const CREDITS_PACKAGE_STATUS = [0, 3]
 /**
  * 11128 重试阶梯的总尝试次数上限（含首发）。
  *
- * 三级：原样 → 强制中性头 → 零宽散点。每一级只在「确实改了字节」且「上一次
- * 是渠道闸拒绝」时才发，所以最坏情况是 3 次、常见情况 1 次。
+ * 三级：改写后的原样 → 强制中性头 → 零宽散点。每一级只在「确实改了字节」且
+ * 「上一次是渠道闸拒绝」时才发，所以最坏情况是 3 次、常见情况 1 次。
  */
 const CHAT_ATTEMPT_LIMIT = 3
 /** 非聊天模型（生图/视频等）：网关 chat 端点不支持，面板不该出现。 */
@@ -894,8 +899,13 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           }
           p.normalizeBody?.(obj)
           body = JSON.stringify(obj)
-          // 串行两步：先字段级归一，再整体文本归一（见 profile 注释）
+          // 串行三步：字段级归一 → 整体文本归一 → 内容指纹按句改写（见 profile 注释）
           if (p.normalizeBodyText !== undefined) body = p.normalizeBodyText(body)
+          // 必须排在 `normalizeBodyText` **之后**、阶梯之前：改写匹配的是宿主自己的
+          // 措辞，任何先插零宽/先改字节的步骤都会让 replaceAll 失配（上游 5.13.1
+          // 的顺序要求）。放在这里意味着**每请求都跑**——与上游一致，且它有别于
+          // 阶梯：改写只动实测命中的那几句，没命中返回原文，代价是一个 includes。
+          body = rewriteChannelFingerprints(body)
         } catch {
           // 保持原样
         }
@@ -922,9 +932,12 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
         // 11128 重试阶梯（2026-10-28，对齐 dsh-connect-workbuddy 的实测结论）：
         // 渠道闸按**请求内容**拒绝，同一个 body 换号、换端点结果都一样，所以它
         // 不是换号能解决的事，只能改请求本身。三级、逐级只在**真改了字节**时才发：
-        //   1. 原样（绝大多数请求走到这里就结束）
+        //   1. 原样 —— 注意它已经不是「未改写的原文」：内容指纹那几句在上面的
+        //      `rewriteChannelFingerprints` 里就改掉了（2026-10-29 起的主修复）
         //   2. 强制中性头：把被禁的开场白挪到 `You are a helpful assistant.` 之后
-        //   3. 零宽散点：在句读/词边界插 U+200B，打断「精确子串」指纹
+        //   3. 零宽散点：在句读/词边界插 U+200B。**这一级对规范化不可见字符的
+        //      网关无效**（CN 网关实测会把 U+200B 规范化掉），保留它是给「不规范化、
+        //      只做精确子串匹配」的老规则用的兜底，不是这一族的解法
         // 三级都在同一个号上跑（闸读的是请求不是账号），失败才报 bad_request 让
         // 核心换下一个供应商——那一步才是「换号」该发生的地方。
         const attempts: string[] = [body]

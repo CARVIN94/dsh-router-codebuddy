@@ -35,7 +35,7 @@ src/
   core.ts       共享实现 —— OAuth 登录、单账号 chat、token 刷新、签到、积分、模型拉取、
                 11128 重试阶梯
   body.ts       出站请求体归一 —— 接口归一（developer/tool_choice/system 头）、
-                WAF 外壳剥离、11128 重试用的中性头与零宽散点
+                内容指纹按句改写、WAF 外壳剥离、11128 重试用的中性头与零宽散点
   cn.ts         codebuddy profile    （copilot.tencent.com：/v2 单路径、CLI 指纹头）
   en.ts         codebuddy-en profile （www.workbuddy.ai：/console→/v2 回退、桌面端指纹头、WAF 净化）
   index.ts      插件入口（host 半，一次注册两个供应商）
@@ -69,7 +69,8 @@ dsh plugin --profile web add dsh-router-codebuddy
 | OAuth 轮询登录 | 生成登录链接 → 浏览器登录 → 后台轮询 token（每 5s，最多 5 分钟），自动落盘凭证。无粘贴回调步骤。 |
 | 模型列表 | 「获取模型」从上游 `GET /v3/config` 实时拉取（带账号 token，服务端下发，新模型上游一上线就能刷出来）；上游不可达时回退内置兜底表；仍可手动添加自定义模型。 |
 | 接口归一（两个供应商） | chat 出站前 `developer` → `system`、`tool_choice` 对象形态 → string、首条非 system 时前置兜底 system —— 规避上游 `11128 first message is not system prompt` / `11101 Unmarshal chat params failed`。国内网关**同样**会拿 11128 拒 DSH 自己的 system 开场白，所以归一两侧都跑。 |
-| 11128 重试阶梯 | 被渠道闸拒绝（`Illegal API invocation from an unapproved channel`）时在**同一个号**上换请求形态重试，最多三级：原样 → 把被禁开场白挪到 `You are a helpful assistant.` 之后 → 在句读/词边界插零宽空格打断精确子串指纹。每级只在确实改了字节时才发；三级都被拒才报 `bad_request`（请求级，不判账号死）。 |
+| 内容指纹按句改写 | **出站前无条件跑**：把上游实测拒收的那几句 DSH 提示词换成同义措辞（identity / coding agent / Web GUI / `Agent Teams` / `@` 路径段逐句）。为什么不是零宽扰动：CN 网关匹配前会**规范化掉不可见字符**，`root\u200b` 这类插法仍 400/11128，只有真改词才 200（2026-10-29 本机实测：同一账号改写后 200、原文 400）。为什么按句：`@` 路径段是**组合**指纹（逐句单发都 200、整段一起 400），且实测最小触发跨度只有该段前 112 字，所以行必须细到句子。没命中任何一行时返回入参原文，逐字节不变。 |
+| 11128 重试阶梯 | 改写之后仍被渠道闸拒绝（`Illegal API invocation from an unapproved channel`）时，在**同一个号**上继续换请求形态重试，最多三级：原样 → 把被禁开场白挪到 `You are a helpful assistant.` 之后 → 在句读/词边界插零宽空格。每级只在确实改了字节时才发；三级都被拒才报 `bad_request`（请求级，不判账号死）。**注意第三级对「规范化零宽」的网关无效**，它是给不规范化、只做精确子串匹配的老规则留的；真正修掉这一族的是上面那层改写。 |
 | 会话身份头 | chat 每请求现生成 `X-Conversation-ID` / `-Request-ID` / `-Message-ID`（官方客户端特征；缺了会撞 11128「不是官方客户端」那一支）。 |
 | 连接池 | 多账号由核心按池顺序/策略（`fallback` / `round-robin`）选号回退，本插件只报告单个账号的成败与语义状态。 |
 | token 自动刷新 | 到期前 24 小时内用 refresh token 刷新（`X-Refresh-Token` 头），刷新失败继续用旧 token。 |

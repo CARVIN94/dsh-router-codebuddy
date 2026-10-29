@@ -11,8 +11,9 @@
  *   4. 两个 id / 存储键 / uid 前缀不变 —— 改它 = 已登录账号全部消失；
  *   5. 国际侧出站净化剥 WAF 敏感词的命令替换外壳，词与其他反引号不动（issue #3）；
  *   6. 403 按 body 形态二分：JSON → session_dead，非 JSON（WAF HTML）→ bad_request；
- *   7. 11128 渠道闸：三级重试阶梯（原样 → 强制中性头 → 零宽散点），耗尽报
- *      bad_request（**不**判账号死）；
+ *   7. 11128 渠道闸：出站前先做内容指纹按句改写（实测被拒的那几句换措辞，
+ *      没命中则逐字节不变），改写后仍被拒才走三级阶梯（原样 → 强制中性头 →
+ *      零宽散点），耗尽报 bad_request（**不**判账号死）；
  *   8. 积分：读 cycle 家族、请求体带分页/产品码、企业号读企业表（剩余 = 上限 − 已用）；
  *   9. 签到：先读 active / today_checked_in，未开活动与已签到都**不发写请求**。
  *
@@ -21,6 +22,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createSupplier } from './core.ts'
+import { rewriteChannelFingerprintPhrases, rewriteChannelFingerprints } from './body.ts'
 import { profile as cn } from './cn.ts'
 import { profile as en } from './en.ts'
 import type { SupplierEnv } from './contract.ts'
@@ -712,10 +714,12 @@ test('11128：先改请求（强制中性头）重试同一个号，重试成功
     assert.equal(r.ok, true, `${p.id}: 中性头重试应当救回来`)
     assert.equal(calls.length, 2, `${p.id}: 第二次是同一端点（闸读请求不读账号）`)
     const messages = calls[1]!.body!.messages as Array<{ role: string; content: string }>
+    // 开场白的内容指纹在**出站前**已被按句改写过（见 body.ts 的 CHANNEL_GATE_PHRASES），
+    // 阶梯只负责把它挪到中性头之后 —— 两件事分开断言，别混成一条。
     assert.match(
       messages[0]!.content,
-      /^You are a helpful assistant\.\n\nYou are an AI agent powered by DeepSeek Harness/,
-      `${p.id}: 被禁开场白必须挪到中性头之后`,
+      /^You are a helpful assistant\.\n\nYou are an AI agent running inside DeepSeek Harness/,
+      `${p.id}: 被禁开场白必须挪到中性头之后（且已是改写后的措辞）`,
     )
   }
 })
@@ -750,6 +754,88 @@ test('非渠道闸的错误不重试（重试只对 11128 有意义）', async (
   const r = await createSupplier(cn)(env).chatOnce('u1', 'auto', { ...req, rawBody: GATED_BODY })
   assert.equal(r.ok === false ? r.state : '', 'bad_request')
   assert.equal(calls.length, 1, '11133 是参数问题，改内容不解决问题，不该重试')
+})
+
+// --------------------------------------- 内容指纹：出站前按句改写（2026-10-29 实测）
+
+/**
+ * 一份**真实形状**的 DSH system：三处实测指纹都在里面，`@` 路径段按宿主原文。
+ *
+ * 为什么要这一份：CN 网关按**内容**拒（11128），而零宽扰动被它规范化掉了 ——
+ * 实测本机同一份 system 只把这几个词换掉就 2/2 全过。测试锁的就是「换掉」。
+ */
+const DSH_SYSTEM = [
+  'You are an AI agent powered by DeepSeek Harness.',
+  'You are a coding agent powered by the qmodel_38max model.',
+  'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.',
+  'Agent Teams is available in this session.',
+  'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.',
+].join('\n\n')
+
+const DSH_BODY = JSON.stringify({
+  model: 'm',
+  messages: [
+    { role: 'system', content: DSH_SYSTEM },
+    { role: 'user', content: 'hi' },
+  ],
+})
+
+test('内容指纹：出站前就把实测命中的句子改写掉（不是靠零宽扰动）', async () => {
+  const { env, calls } = harness(cn.id)
+  routed(calls, () => okStream())
+  await createSupplier(cn)(env).chatOnce('u1', 'auto', { ...req, rawBody: DSH_BODY })
+  const sent = String(calls[0]!.init.body)
+  for (const from of [
+    'You are an AI agent powered by DeepSeek Harness',
+    'You are a coding agent powered by the ',
+    'You are interacting with the user through the DeepSeek Harness Web GUI',
+    'Agent Teams is available in this session',
+    'Tokens prefixed with @ are paths the user explicitly referenced.',
+    'Relative paths resolve from the workspace root;',
+    '@"..." quotes a path containing spaces.',
+  ]) {
+    assert.ok(!sent.includes(from), `命中句必须已被改写：${from}`)
+  }
+  // 语义不变：改写后的句子仍是指令，不是被删掉
+  assert.ok(sent.includes('You are an AI agent running inside DeepSeek Harness.'))
+  assert.ok(sent.includes('Paths that begin with @ are the ones the user explicitly referenced.'))
+})
+
+test('内容指纹：截断形态（该段前 112 字）也会被清掉 —— 最小触发跨度只到第二句', () => {
+  // #164 实测：`@` 路径段前两句（112 字）就会 11128，两句各自单发都 200。
+  // 所以只覆盖整段的字面量不够，行必须细到句子。
+  const truncated = 'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root'
+  const out = rewriteChannelFingerprintPhrases(truncated)
+  assert.ok(!out.includes('Tokens prefixed with @ are paths the user explicitly referenced.'))
+  assert.ok(!out.includes('Relative paths resolve from the workspace root'))
+  assert.ok(out.includes('Paths that begin with @ are the ones the user explicitly referenced.'))
+})
+
+test('内容指纹：普通对话逐字节不变，且改写幂等', () => {
+  const ordinary = 'A perfectly ordinary sentence. And one more.'
+  assert.equal(rewriteChannelFingerprintPhrases(ordinary), ordinary)
+  const once = rewriteChannelFingerprintPhrases(DSH_SYSTEM)
+  assert.equal(rewriteChannelFingerprintPhrases(once), once, '第二遍必须是空操作')
+})
+
+test('内容指纹：只碰 system/assistant，user 自己的话一个字都不改', () => {
+  const body = JSON.stringify({
+    model: 'm',
+    messages: [
+      { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness.' },
+      { role: 'user', content: 'You are an AI agent powered by DeepSeek Harness.' },
+    ],
+  })
+  const out = rewriteChannelFingerprints(body)
+  const msgs = (JSON.parse(out) as { messages: Array<{ role: string; content: string }> }).messages
+  assert.ok(!msgs[0]!.content.includes('powered by'), 'system 必须改写')
+  assert.ok(msgs[1]!.content.includes('powered by'), 'user 原文必须保留（闸不扫它，改它等于篡改用户输入）')
+})
+
+test('内容指纹：没命中任何一行 → 返回入参原文（不重新序列化）', () => {
+  // 上游本来就 200 的请求必须逐字节不变：这里故意给一份「格式不规范但没指纹」的 body
+  const untouched = '{"model":"m",   "messages":[{"role":"user","content":"hi"}]}'
+  assert.equal(rewriteChannelFingerprints(untouched), untouched)
 })
 
 test('会话身份三连每请求现生成，不是固定值', async () => {
