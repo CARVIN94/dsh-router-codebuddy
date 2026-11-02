@@ -398,7 +398,7 @@ test('模型级拒绝：11102（已下架）归 no_such_model，11103（生图�
  * 那两个可用号就永远轮不到——一个错误分类直接变成可用性损失。
  * 同理也**不能**按 HTTP 状态之外的顺序把它提前判成请求级。
  */
-test('403 + 11140 是账号级风控：归 session_dead（可换号），绝不归 bad_request', async () => {
+test('403 + 11140 是账号级风控：归 restricted（可换号），绝不归 bad_request', async () => {
   assert.equal(en.classifyGatewayCode?.(11140), undefined, '11140 不参与 code 归类（它是账号级，不是请求级）')
   assert.equal(cn.classifyGatewayCode?.(11140), undefined)
   for (const p of [cn, en] as const) {
@@ -415,7 +415,40 @@ test('403 + 11140 是账号级风控：归 session_dead（可换号），绝不�
       return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
     }) as typeof fetch
     const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
-    assert.equal(r.ok === false ? r.state : '', 'session_dead', `${p.id}: 403/11140 必须可换号，否则丢掉健康号`)
+    // `restricted` 而不是 `session_dead`：处置一样（冷却 + 换号），差别在给用户看的
+    // 那句话。凭证失效会让人去重新登录，而这里登录没用——同一 token 在别处还能用，
+    // 被限制的是这个号的行为，且实测 30 分钟后自行恢复。
+    assert.equal(r.ok === false ? r.state : '', 'restricted', `${p.id}: 403/11140 必须可换号，否则丢掉健康号`)
+  }
+})
+
+/**
+ * `restricted` 的报文要说清「不是凭证问题」。
+ *
+ * 上游 11140 的 `displayMsg` 常写 "The content did not pass the safety review."——
+ * 读起来像内容审核。照抄会让用户去改提示词，而真正该做的是换个号继续：同一 token
+ * 在别处仍然可用，这个号 30 分钟后自行恢复，重新登录不会有任何变化。
+ */
+test('restricted 的报文说清不是凭证问题、也不要去改提示词', async () => {
+  for (const p of [cn, en] as const) {
+    const { env } = harness(p.id)
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('/chat/completions')) {
+        return new Response(
+          JSON.stringify({ code: 11140, msg: 'request illegal', displayMsg: { en: 'The content did not pass the safety review.' } }),
+          { status: 403 },
+        )
+      }
+      return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+    }) as typeof fetch
+    const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
+    const message = r.ok === false ? r.message : ''
+    assert.equal(r.ok === false ? r.state : '', 'restricted')
+    assert.match(message, /账号/, `${p.id}: 报文必须指明是账号问题`)
+    assert.match(message, /无关/, `${p.id}: 报文必须说明与请求内容和凭证无关`)
+    assert.match(message, /换号/, `${p.id}: 报文必须给出可行动作`)
+    assert.match(message, /无需重新登录/, `${p.id}: 报文必须拦住「去重新登录」这条死路`)
   }
 })
 

@@ -26,6 +26,9 @@ import {
   rewriteChannelFingerprints,
 } from './body.ts'
 
+/** WorkBuddy 的账号级风控业务码。 */
+const RESTRICTED_CODE = 11140
+
 /**
  * 一个上游网关的差异描述 —— codebuddy 族两个供应商的全部不同都在这里。
  *
@@ -1048,16 +1051,32 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           // 不去，换号无济于事。
           const channelReject = isChannelRejectBody(text)
           const byCode = gwCode === undefined ? undefined : p.classifyGatewayCode?.(gwCode)
+          // 11140 是**账号级风控**，与凭证失效分开报（见 contract.ts 的 restricted）。
+          // 处置相同（冷却 + 换号），差别在给用户看的那句话：凭证失效会让人去重新
+          // 登录，而这里登录没用——同一 token 在别处还能用。
+          //
+          // 用 code 判而不是 `displayMsg`：实测那句写的是 "The content did not pass
+          // the safety review."，读起来像内容审核，但**不带任何 user 消息也一样被拒**，
+          // 同一时刻换号就成功。照措辞判会把账号级错判成请求级。
+          const accountRestricted = gwCode === RESTRICTED_CODE
           const state: AccountState =
             lastStatus === 429 ? 'rate_limit'
               : channelReject ? 'bad_request'
-                : lastStatus === 401 || (lastStatus === 403 && isJsonBody) ? 'session_dead'
-                  : lastStatus === 403 ? 'bad_request'
-                    : lastStatus === 404 ? 'unavailable'
-                      : byCode ?? (extType === 'invalid_request_error' ? 'bad_request' : 'unknown')
+                : accountRestricted ? 'restricted'
+                  : lastStatus === 401 || (lastStatus === 403 && isJsonBody) ? 'session_dead'
+                    : lastStatus === 403 ? 'bad_request'
+                      : lastStatus === 404 ? 'unavailable'
+                        : byCode ?? (extType === 'invalid_request_error' ? 'bad_request' : 'unknown')
           // 限流文案自带重置时刻（6004「将在 … 重置」）→ 交给核心冷到那个点
           const resetAt = state === 'rate_limit' ? resetAtOf(text) : undefined
-          return { ok: false, state, message: gwErr, ...(resetAt === undefined ? {} : { resetAt }) }
+          // 风控的报文要说清「不是凭证问题」。上游的 `displayMsg` 常指向内容审核，
+          // 照抄会让用户去改提示词，而真正该做的是换个号继续——账号本身 30 分钟
+          // 后自行恢复。
+          const message = state === 'restricted'
+            ? `${gwErr}｜该账号被上游按账号做了风控（code ${RESTRICTED_CODE}），与本次请求内容和凭证都无关：`
+              + '同一 token 在其他请求上仍然可用，换号即可继续；该账号约 30 分钟后自行恢复，无需重新登录'
+            : gwErr
+          return { ok: false, state, message, ...(resetAt === undefined ? {} : { resetAt }) }
         }
         // 上游恒为流式：原样交回核心写
         if (!upstream.body) {
