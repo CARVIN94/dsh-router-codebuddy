@@ -19,6 +19,7 @@
  */
 import type { ChatRequest, ModelInfo } from './types.ts'
 import type { AccountState, ChatOnceResult, SupplierEnv, SupplierModule, SupplierStatusNow } from './contract.ts'
+import { businessCodeOf, businessCodeOfDocument } from './envelope.ts'
 import {
   forceNeutralHead,
   isChannelRejectBody,
@@ -1017,16 +1018,25 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           // 都会失败。归 rate_limit 冷号会把「这条请求有问题」放大成「这个
           // 模型 30 秒内谁都别用」，组合两条腿同时被冷就是全灭 503 的成因。
           // 所以这类报 `bad_request`（核心不惩罚账号，直接换下一个）。
+          // 信封码统一走 envelope.ts 的读码器（2026-11-03 订正）：此前这里只认
+          // 顶层数字 code，与 isChannelRejectBody 各读各的。代理/重序列化可造出
+          // `{"code": 11140}`（空格）、`"code":"11140"`（字符串）、嵌套
+          // `error.code` 三种漏判拼法——403 + JSON 下漏判会掉进 session_dead，
+          // 报文变成「凭证失效」，把健康号往重新登录的死路上引（上游 issue
+          // #127/#155 同型事故）。读码顺序与不读 extError.code 的取舍见 envelope.ts。
+          // isJsonBody 仍单独判：它是 403 二分（WAF HTML vs 业务 JSON）的形状依据，
+          // 与信封有没有 code 是两回事。
           let gwCode: number | undefined
           let extType: string | undefined
           let isJsonBody = false
           try {
-            const j = JSON.parse(text) as { code?: number; extError?: { type?: string } }
+            const j = JSON.parse(text) as { extError?: { type?: string } }
             isJsonBody = true
-            gwCode = typeof j.code === 'number' ? j.code : undefined
+            gwCode = businessCodeOfDocument(j)
             extType = typeof j.extError?.type === 'string' ? j.extError.type : undefined
           } catch {
-            // 非 JSON：靠 HTTP 状态分类
+            // 非 JSON（截断体/WAF HTML）：正则兜底仍可能读到 code；形状分类靠 HTTP 状态
+            gwCode = businessCodeOf(text)
           }
           // 明确认得的 code 优先（如 11134 是上游临时不可用，仍走 rate_limit
           // 短冷换号）；两家里未枚举的新 code 才落到 extError.type 兜底。
@@ -1058,7 +1068,11 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           // 用 code 判而不是 `displayMsg`：实测那句写的是 "The content did not pass
           // the safety review."，读起来像内容审核，但**不带任何 user 消息也一样被拒**，
           // 同一时刻换号就成功。照措辞判会把账号级错判成请求级。
-          const accountRestricted = gwCode === RESTRICTED_CODE
+          // gwCode 落空且是 JSON 时再查原文小写键：解析成功但没读到 code 字段的
+          // 重序列化拼写（如大写键 {"CODE":11140,…}）——businessCodeOfDocument
+          // 只认小写键，这层兜底别丢（上游 issue155 的两半合一）。
+          const accountRestricted =
+            gwCode === RESTRICTED_CODE || (isJsonBody && text.toLowerCase().includes(`"code":${RESTRICTED_CODE}`))
           const state: AccountState =
             lastStatus === 429 ? 'rate_limit'
               : channelReject ? 'bad_request'
@@ -1070,11 +1084,16 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           // 限流文案自带重置时刻（6004「将在 … 重置」）→ 交给核心冷到那个点
           const resetAt = state === 'rate_limit' ? resetAtOf(text) : undefined
           // 风控的报文要说清「不是凭证问题」。上游的 `displayMsg` 常指向内容审核，
-          // 照抄会让用户去改提示词，而真正该做的是换个号继续——账号本身 30 分钟
-          // 后自行恢复。
+          // 照抄会让用户去改提示词，而真正该做的是换个号继续。
+          //
+          // 「约 30 分钟后自行恢复」删去（2026-11-03）：上游实测订正过这条表述
+          // 不成立——停权账号的回池路径实测只有手动「测试」覆盖测量一条，
+          // 重登/导入都不会清这条记录（账号 id 是 uin/uid 的 sha256，重登后
+          // 仍是同一 id）。本地也未实测到过 30 分钟自愈；留着它只会让人干等。
           const message = state === 'restricted'
             ? `${gwErr}｜该账号被上游按账号做了风控（code ${RESTRICTED_CODE}），与本次请求内容和凭证都无关：`
-              + '同一 token 在其他请求上仍然可用，换号即可继续；该账号约 30 分钟后自行恢复，无需重新登录'
+              + '同一 token 在其他请求上仍然可用，换号即可继续，无需重新登录；' +
+              '这个号稍后可在账号池「测试」里验证是否已解除'
             : gwErr
           return { ok: false, state, message, ...(resetAt === undefined ? {} : { resetAt }) }
         }

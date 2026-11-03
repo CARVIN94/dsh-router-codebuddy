@@ -393,10 +393,10 @@ test('模型级拒绝：11102（已下架）归 no_such_model，11103（生图�
  *   wb-1 system+hi   → 403/11140    wb-2 → 200    wb-3 → 200
  *   wb-1 不存在的模型 → 403/11140    wb-2 → 400/11102（模型级，正常报）
  *
- * 它描述的是「这个账号被风控」，所以必须是 session_dead（连接级冷却 30 分钟、
- * 到期自愈、**逐号换**）。若误判成 bad_request，核心会**跳过整个供应商**，
- * 那两个可用号就永远轮不到——一个错误分类直接变成可用性损失。
- * 同理也**不能**按 HTTP 状态之外的顺序把它提前判成请求级。
+ * 它描述的是「这个账号被风控」，所以归 restricted（处置同 session_dead：
+ * 连接级冷却、**逐号换**；2026-11-03 起 e5657bd）。若误判成 bad_request，
+ * 核心会**跳过整个供应商**，那两个可用号就永远轮不到——一个错误分类直接变成
+ * 可用性损失。同理也**不能**按 HTTP 状态之外的顺序把它提前判成请求级。
  */
 test('403 + 11140 是账号级风控：归 restricted（可换号），绝不归 bad_request', async () => {
   assert.equal(en.classifyGatewayCode?.(11140), undefined, '11140 不参与 code 归类（它是账号级，不是请求级）')
@@ -417,7 +417,7 @@ test('403 + 11140 是账号级风控：归 restricted（可换号），绝不归
     const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
     // `restricted` 而不是 `session_dead`：处置一样（冷却 + 换号），差别在给用户看的
     // 那句话。凭证失效会让人去重新登录，而这里登录没用——同一 token 在别处还能用，
-    // 被限制的是这个号的行为，且实测 30 分钟后自行恢复。
+    // 被限制的是这个号的行为。
     assert.equal(r.ok === false ? r.state : '', 'restricted', `${p.id}: 403/11140 必须可换号，否则丢掉健康号`)
   }
 })
@@ -427,7 +427,8 @@ test('403 + 11140 是账号级风控：归 restricted（可换号），绝不归
  *
  * 上游 11140 的 `displayMsg` 常写 "The content did not pass the safety review."——
  * 读起来像内容审核。照抄会让用户去改提示词，而真正该做的是换个号继续：同一 token
- * 在别处仍然可用，这个号 30 分钟后自行恢复，重新登录不会有任何变化。
+ * 在别处仍然可用，重新登录不会有任何变化。也不承诺自愈时限——上游实测停权
+ * 账号的回池路径只有手动「测试」，报文现在指向那条路径（2026-11-03 订正）。
  */
 test('restricted 的报文说清不是凭证问题、也不要去改提示词', async () => {
   for (const p of [cn, en] as const) {
@@ -449,6 +450,51 @@ test('restricted 的报文说清不是凭证问题、也不要去改提示词', 
     assert.match(message, /无关/, `${p.id}: 报文必须说明与请求内容和凭证无关`)
     assert.match(message, /换号/, `${p.id}: 报文必须给出可行动作`)
     assert.match(message, /无需重新登录/, `${p.id}: 报文必须拦住「去重新登录」这条死路`)
+    // 2026-11-03 订正：「约 30 分钟后自行恢复」这句删了——上游实测停权账号的
+    // 回池路径只有手动「测试」，30 分钟自愈从未被实测到，留着让人干等。
+    assert.doesNotMatch(message, /30 ?分钟/, `${p.id}: 不得承诺 30 分钟自愈`)
+    assert.match(message, /测试/, `${p.id}: 给出回池验证路径（账号池「测试」）`)
+  }
+})
+
+/**
+ * **11140 信封的读码拼法**（2026-11-03，移植上游 issue #127/#155 的读码器）。
+ *
+ * 此前 core.ts 只认顶层**数字** `code`，而代理、重序列化器、嵌套信封能造出
+ * 至少四种同样合法的拼法。漏判的后果不是中性的：403 + JSON 下漏判掉进
+ * `session_dead`，报文变成「凭证失效」，把健康号往重新登录的死路上引。
+ *
+ * 期望全为 `restricted`——拼法不同，业务事实是同一个：账号被按账号风控。
+ */
+test('11140 信封读码：数字/字符串/带空格/嵌套/大写键/截断体 全部归 restricted', async () => {
+  const bodies = [
+    ['紧凑数字', '{"code":11140,"msg":"request illegal","displayMsg":{"en":"The content did not pass the safety review."}}'],
+    ['带空格', '{ "code": 11140, "msg": "request illegal" }'],
+    ['字符串码', '{"code":"11140","msg":"request illegal"}'],
+    ['error.code 嵌套', '{"error":{"code":11140,"message":"request illegal"}}'],
+    ['error.data.code 嵌套', '{"error":{"data":{"code":11140}}}'],
+    ['data.code 嵌套', '{"data":{"code":11140,"msg":"request illegal"}}'],
+    ['大写键重序列化', '{"CODE":11140,"MSG":"REQUEST ILLEGAL"}'],
+    ['非 JSON 截断体（code 之后被截断）', '{"code":11140,"msg":"request'],
+    // requestId 是十六进制，可能与业务码数字巧合——裸数字不能中（上游正则锚定带引号键）。
+    ['requestId 巧合不中', '{"requestId":"a11140b","msg":"request illegal"}'],
+  ] as const
+  for (const p of [cn, en] as const) {
+    for (const [label, body] of bodies) {
+      const { env } = harness(p.id)
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = String(input)
+        if (url.includes('/chat/completions')) return new Response(body, { status: 403 })
+        return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+      }) as typeof fetch
+      const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
+      const want = label === 'requestId 巧合不中' ? 'session_dead' : 'restricted'
+      assert.equal(
+        r.ok === false ? r.state : '',
+        want,
+        `${p.id} ${label}: 期望 ${want}`,
+      )
+    }
   }
 })
 

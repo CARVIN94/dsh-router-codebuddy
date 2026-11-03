@@ -108,7 +108,7 @@ export const profile: SupplierProfile = {
   // 也一样被拒；而同一时刻同请求换本机另外两个号（wb-2/wb-3）都能正常出字。
   // 也就是说它描述的是「这个账号被风控了」，不是「这条请求有问题」。
   // 归 bad_request 会让核心**跳过整个供应商、失去换号**，正好丢掉那两个可用号；
-  // 留在默认的 403 → session_dead（连接级冷却 30 分钟、到期自愈、逐号换）才对。
+  // 留在默认的 403 → restricted（处置同 session_dead：连接级冷却、逐号换）才对。
   // 该判据只适用于 403 + **JSON body**（业务风控带 code）；403 + 非 JSON（WAF
   // Block Page HTML）是请求级拦截，core.ts 归 bad_request（issue #3）。
   classifyGatewayCode: (code) => {
