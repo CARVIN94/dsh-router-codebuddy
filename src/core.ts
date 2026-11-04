@@ -1061,30 +1061,55 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
           // 不去，换号无济于事。
           const channelReject = isChannelRejectBody(text)
           const byCode = gwCode === undefined ? undefined : p.classifyGatewayCode?.(gwCode)
-          // 11140 是**账号级风控**，与凭证失效分开报（见 contract.ts 的 restricted）。
-          // 处置相同（冷却 + 换号），差别在给用户看的那句话：凭证失效会让人去重新
-          // 登录，而这里登录没用——同一 token 在别处还能用。
+          // 11140 有两种语义，**按 HTTP 状态分**，不按 `displayMsg` 措辞分：
           //
-          // 用 code 判而不是 `displayMsg`：实测那句写的是 "The content did not pass
-          // the safety review."，读起来像内容审核，但**不带任何 user 消息也一样被拒**，
-          // 同一时刻换号就成功。照措辞判会把账号级错判成请求级。
+          //  - `403 + 11140` → **账号级**风控（`restricted`）。本仓 2026-10-10 实测：
+          //    同一份无害内容（甚至仅 system、不带任何 user 消息）在 wb-1 上
+          //    403/11140，而同一时刻 wb-2 / wb-3 同请求 200。它的 `displayMsg` 写
+          //    的是 "The content did not pass the safety review."——照措辞判会把
+          //    账号级错判成请求级，那才是 10-10 事故的成因。
+          //
+          //  - `400 + 11140` → **请求级**（`bad_request`）。400 的 HTTP 语义就是
+          //    「这份请求有问题」，换号对每个号结果相同；逐号冷却会把「一条请求
+          //    有问题」放大成「整个池冷却一轮」，号数少时一次内容审核拒绝就让全部
+          //    连接显示成被风控，最后 503。上游 dsh-connect-workbuddy 同样把它归
+          //    `policy_reject`（请求级，issue #127 的两半判定）。
+          //
+          //    只认 **400**，不推广到其它非 403 状态：401 是凭证失效、429 已单独
+          //    处理、5xx 是上游自己的故障——把它们并进「请求有问题」会各自变成
+          //    另一种误判。400 是上游内容闸唯一实测到的那一个。
+          //
+          // 为什么不用措辞那半（上游 wbup 的两半判定）：11140 的账号级与内容级
+          // **共用同一个 `displayMsg`**（wbup 自己的注释也承认），措辞在那里是
+          // 软信号；HTTP 状态是硬信号，且本仓的实测正是在 403 上做的。
+          //
           // gwCode 落空且是 JSON 时再查原文小写键：解析成功但没读到 code 字段的
           // 重序列化拼写（如大写键 {"CODE":11140,…}）——businessCodeOfDocument
           // 只认小写键，这层兜底别丢（上游 issue155 的两半合一）。
-          const accountRestricted =
+          const restrictedCode =
             gwCode === RESTRICTED_CODE || (isJsonBody && text.toLowerCase().includes(`"code":${RESTRICTED_CODE}`))
+          const accountRestricted = restrictedCode && lastStatus === 403
+          // 请求级的那一半：同一个 11140，但上游用 400 说的是「这份请求有问题」
+          const requestRejected = restrictedCode && lastStatus === 400
           const state: AccountState =
             lastStatus === 429 ? 'rate_limit'
               : channelReject ? 'bad_request'
                 : accountRestricted ? 'restricted'
-                  : lastStatus === 401 || (lastStatus === 403 && isJsonBody) ? 'session_dead'
-                    : lastStatus === 403 ? 'bad_request'
-                      : lastStatus === 404 ? 'unavailable'
-                        : byCode ?? (extType === 'invalid_request_error' ? 'bad_request' : 'unknown')
+                  : requestRejected ? 'bad_request'
+                    : lastStatus === 401 || (lastStatus === 403 && isJsonBody) ? 'session_dead'
+                      : lastStatus === 403 ? 'bad_request'
+                        : lastStatus === 404 ? 'unavailable'
+                          : byCode ?? (extType === 'invalid_request_error' ? 'bad_request' : 'unknown')
           // 限流文案自带重置时刻（6004「将在 … 重置」）→ 交给核心冷到那个点
           const resetAt = state === 'rate_limit' ? resetAtOf(text) : undefined
-          // 风控的报文要说清「不是凭证问题」。上游的 `displayMsg` 常指向内容审核，
-          // 照抄会让用户去改提示词，而真正该做的是换个号继续。
+          // 两种 11140 的报文必须分开说，否则用户按错的那句去行动：
+          //
+          //  - `restricted`（403）说的是**账号**：换号即可，重登无用。上游的
+          //    `displayMsg` 常指向内容审核，照抄会让人去改提示词。
+          //
+          //  - `bad_request`（400）说的是**这份请求**：换号无用（每个号都会拒），
+          //    要改的是内容。报文必须拦住「换号重试」这条死路，也不能把它说成
+          //    凭证问题——那是第三种错误方向。
           //
           // 「约 30 分钟后自行恢复」删去（2026-11-03）：上游实测订正过这条表述
           // 不成立——停权账号的回池路径实测只有手动「测试」覆盖测量一条，
@@ -1094,7 +1119,11 @@ export function createSupplier(p: SupplierProfile): (env: SupplierEnv) => Suppli
             ? `${gwErr}｜该账号被上游按账号做了风控（code ${RESTRICTED_CODE}），与本次请求内容和凭证都无关：`
               + '同一 token 在其他请求上仍然可用，换号即可继续，无需重新登录；' +
               '这个号稍后可在账号池「测试」里验证是否已解除'
-            : gwErr
+            : state === 'bad_request' && requestRejected
+              ? `${gwErr}｜上游以 400 拒收这份请求（code ${RESTRICTED_CODE}），是**请求内容**的问题，`
+                + '不是账号或凭证：同一份内容换任何号都会得到同样的拒绝，换号/重登都不会改变结果，'
+                + '需要调整的是这次发送的内容'
+              : gwErr
           return { ok: false, state, message, ...(resetAt === undefined ? {} : { resetAt }) }
         }
         // 上游恒为流式：原样交回核心写

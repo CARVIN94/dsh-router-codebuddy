@@ -396,10 +396,13 @@ test('模型级拒绝：11102（已下架）归 no_such_model，11103（生图�
  * 它描述的是「这个账号被风控」，所以归 restricted（处置同 session_dead：
  * 连接级冷却、**逐号换**；2026-11-03 起 e5657bd）。若误判成 bad_request，
  * 核心会**跳过整个供应商**，那两个可用号就永远轮不到——一个错误分类直接变成
- * 可用性损失。同理也**不能**按 HTTP 状态之外的顺序把它提前判成请求级。
+ * 可用性损失。
+ *
+ * **这条只讲 403。** 同一个 11140 随 400 到达是请求级（见「400 + 11140」那条
+ * 测试）：分界取 HTTP 状态，不取 `displayMsg`——两种语义共用同一句话。
  */
 test('403 + 11140 是账号级风控：归 restricted（可换号），绝不归 bad_request', async () => {
-  assert.equal(en.classifyGatewayCode?.(11140), undefined, '11140 不参与 code 归类（它是账号级，不是请求级）')
+  assert.equal(en.classifyGatewayCode?.(11140), undefined, '11140 不参与 code 归类（它随状态分两支，不是单一的请求级）')
   assert.equal(cn.classifyGatewayCode?.(11140), undefined)
   for (const p of [cn, en] as const) {
     const { env, calls } = harness(p.id)
@@ -464,9 +467,10 @@ test('restricted 的报文说清不是凭证问题、也不要去改提示词', 
  * 至少四种同样合法的拼法。漏判的后果不是中性的：403 + JSON 下漏判掉进
  * `session_dead`，报文变成「凭证失效」，把健康号往重新登录的死路上引。
  *
- * 期望全为 `restricted`——拼法不同，业务事实是同一个：账号被按账号风控。
+ * 期望全为 `restricted`——拼法不同，业务事实是同一个：**403 上的**账号风控。
+ * 状态门见下面两条（同一个 code 随 400 到达是请求级）。
  */
-test('11140 信封读码：数字/字符串/带空格/嵌套/大写键/截断体 全部归 restricted', async () => {
+test('11140 信封读码（403）：数字/字符串/带空格/嵌套/大写键/截断体 全部归 restricted', async () => {
   const bodies = [
     ['紧凑数字', '{"code":11140,"msg":"request illegal","displayMsg":{"en":"The content did not pass the safety review."}}'],
     ['带空格', '{ "code": 11140, "msg": "request illegal" }'],
@@ -494,6 +498,70 @@ test('11140 信封读码：数字/字符串/带空格/嵌套/大写键/截断体
         want,
         `${p.id} ${label}: 期望 ${want}`,
       )
+    }
+  }
+})
+
+/**
+ * **同一个 11140，随 400 到达就是请求级**（2026-11-04）。
+ *
+ * 这是「一个连接被风控 → 全部连接被风控」的真实成因。核心在供应商内**逐号**
+ * 遍历（`dsh-router` 的 `chatWithSupplier`），而 `restricted` 是连接级冷却：
+ * 号数少时一次请求就把每个号冷一遍，最后 `503 no_healthy_supplier`——用户看到
+ * 的是「全都风控了」，而真正有问题的只是这一份请求内容。
+ *
+ * 400 的 HTTP 语义就是「这份请求有问题」，对每个号结果相同，换号只会把同一个
+ * 拒绝再吃一遍。上游 `dsh-connect-workbuddy` 对同一字节同样判 `policy_reject`
+ * （请求级，issue #127 的两半判定）。
+ *
+ * 403 那支**不动**：本仓 2026-10-10 实测同一份无害内容（甚至仅 system）在
+ * wb-1 上 403/11140，同一时刻 wb-2 / wb-3 同请求 200——那是账号级，换号正好。
+ * 所以分界取 HTTP 状态（硬信号），不取 `displayMsg` 措辞（两半共用同一句，
+ * wbup 自己的注释也承认它是软信号）。
+ */
+test('★ 400 + 11140 归 bad_request（请求级，不逐号冷池）；403 + 11140 仍是 restricted', async () => {
+  for (const p of [cn, en] as const) {
+    for (const [status, want] of [[400, 'bad_request'], [403, 'restricted']] as const) {
+      const { env } = harness(p.id)
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = String(input)
+        if (url.includes('/chat/completions')) {
+          return new Response(JSON.stringify({ code: 11140, msg: 'request illegal' }), { status })
+        }
+        return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+      }) as typeof fetch
+      const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
+      assert.equal(r.ok === false ? r.state : '', want, `${p.id}: ${status} + 11140 期望 ${want}`)
+      if (want === 'bad_request') {
+        // 报文必须拦住「换号重试」这条死路，也不能说成凭证问题
+        const message = r.ok === false ? r.message : ''
+        assert.match(message, /请求/, `${p.id}: 报文必须指明是请求内容的问题`)
+        assert.match(message, /不会改变/, `${p.id}: 报文必须说清换号无用`)
+        assert.doesNotMatch(message, /重新登录/, `${p.id}: 不得往「重登」这条死路引`)
+      }
+    }
+  }
+})
+
+/**
+ * 11140 的状态门只认 **400**：401 / 429 / 5xx 各走各的处置。
+ *
+ * 把它们一并吞进「请求有问题」各自会变成另一种误判——401 会让人不去重登、
+ * 429 会丢掉限流退避、500 会放弃一次本来能靠换号恢复的请求。
+ */
+test('11140 状态门只认 400：401 → session_dead、429 → rate_limit、500 → unknown', async () => {
+  for (const p of [cn, en] as const) {
+    for (const [status, want] of [[401, 'session_dead'], [429, 'rate_limit'], [500, 'unknown']] as const) {
+      const { env } = harness(p.id)
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = String(input)
+        if (url.includes('/chat/completions')) {
+          return new Response(JSON.stringify({ code: 11140, msg: 'request illegal' }), { status })
+        }
+        return new Response(JSON.stringify({ code: 1234, msg: 'nope' }), { status: 500 })
+      }) as typeof fetch
+      const r = await createSupplier(p)(env).chatOnce('u1', 'auto', req)
+      assert.equal(r.ok === false ? r.state : '', want, `${p.id}: ${status} + 11140 期望 ${want}`)
     }
   }
 })
